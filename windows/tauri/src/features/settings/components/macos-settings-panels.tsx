@@ -1,7 +1,10 @@
 import { getVersion } from "@tauri-apps/api/app";
+import { open } from "@tauri-apps/plugin-dialog";
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { themeRegistry } from "@/extensions/themes/theme-registry";
 import { useRegisteredThemes } from "@/extensions/themes/use-registered-themes";
+import { useMavenStore } from "@/features/maven/stores/maven.store";
+import type { MavenSettings } from "@/features/maven/types/maven.types";
 import { useUpdater } from "@/features/settings/hooks/use-updater";
 import { useSettingsStore } from "@/features/settings/stores/settings.store";
 import {
@@ -11,6 +14,7 @@ import {
 } from "@/features/settings/lib/project-open-preference";
 import { useTranslation } from "@/i18n/locale-provider";
 import { Button } from "@/ui/button";
+import { FolderIcon, TrashIcon } from "@/ui/icons";
 import Switch from "@/ui/switch";
 import { LogSettingsPanel } from "./log-settings-panel";
 
@@ -20,6 +24,7 @@ export type MacSettingsCategory =
   | "keyboard"
   | "terminal"
   | "lsp"
+  | "maven"
   | "ai"
   | "logs"
   | "updates";
@@ -384,6 +389,116 @@ function TerminalPanel() {
   );
 }
 
+function MavenPanel() {
+  const { t } = useTranslation();
+  const project = useMavenStore((state) => state.project);
+  const projectStatus = useMavenStore((state) => state.projectStatus);
+  const settingsPath = useMavenStore((state) => state.settingsPath);
+  const mavenExecutablePath = useMavenStore((state) => state.mavenExecutablePath);
+  const javaHomePath = useMavenStore((state) => state.javaHomePath);
+  const configurationSaveError = useMavenStore((state) => state.configurationSaveError);
+  const updateLocalConfiguration = useMavenStore((state) => state.actions.updateLocalConfiguration);
+  const [draft, setDraft] = useState<MavenSettings>({
+    settingsPath,
+    mavenExecutablePath,
+    javaHomePath,
+  });
+
+  const fields = [
+    { field: "settingsPath" as const, label: "settings.xml", directory: false },
+    { field: "mavenExecutablePath" as const, label: t("maven.mavenExecutable"), directory: true },
+    { field: "javaHomePath" as const, label: t("maven.javaHome"), directory: true },
+  ];
+
+  // Re-sync the draft when the persisted configuration changes, e.g. when the
+  // Maven project finishes loading after the panel is already open.
+  useEffect(() => {
+    setDraft({ settingsPath, mavenExecutablePath, javaHomePath });
+  }, [settingsPath, mavenExecutablePath, javaHomePath]);
+
+  const dirty =
+    draft.settingsPath !== settingsPath ||
+    draft.mavenExecutablePath !== mavenExecutablePath ||
+    draft.javaHomePath !== javaHomePath;
+
+  const choosePath = async (field: keyof MavenSettings, directory: boolean) => {
+    const selected = await open({
+      directory,
+      multiple: false,
+      ...(field === "settingsPath"
+        ? { filters: [{ name: "Maven settings", extensions: ["xml"] }] }
+        : {}),
+    });
+    if (typeof selected === "string") setDraft((current) => ({ ...current, [field]: selected }));
+  };
+
+  return (
+    <SettingsGroup title={t("maven.settings")}>
+      <p className="ui-text-caption leading-relaxed text-subtle-foreground">
+        {t("maven.settingsDescription")}
+      </p>
+      {project ? null : (
+        <p className="ui-text-sm text-subtle-foreground" role="status">
+          {projectStatus === "loading" ? t("maven.scanning") : t("maven.notDetected")}
+        </p>
+      )}
+      {fields.map(({ field, label, directory }) => (
+        <label key={field} className="flex flex-col gap-1.5 ui-text-sm text-foreground">
+          {label}
+          <div className="flex gap-2">
+            <input
+              className={`${controlClassName} min-w-0 flex-1 font-mono`}
+              value={draft[field]}
+              placeholder={t("maven.automatic")}
+              disabled={!project}
+              onChange={(event) =>
+                setDraft((current) => ({ ...current, [field]: event.target.value }))
+              }
+            />
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon-sm"
+              disabled={!project}
+              title={t("ui.clear")}
+              aria-label={t("ui.clear")}
+              onClick={() => setDraft((current) => ({ ...current, [field]: "" }))}
+            >
+              <TrashIcon />
+            </Button>
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon-sm"
+              disabled={!project}
+              title={t("ui.browse")}
+              aria-label={t("ui.browse")}
+              onClick={() => void choosePath(field, directory)}
+            >
+              <FolderIcon />
+            </Button>
+          </div>
+        </label>
+      ))}
+      {configurationSaveError ? (
+        <p className="ui-text-sm text-destructive" role="alert">
+          {configurationSaveError}
+        </p>
+      ) : null}
+      <div className="flex justify-end">
+        <Button
+          variant="accent"
+          size="sm"
+          disabled={!project || !dirty}
+          onClick={() => updateLocalConfiguration(draft)}
+        >
+          {t("settings.mac.apply")}
+        </Button>
+      </div>
+    </SettingsGroup>
+  );
+}
+
 function LspPanel() {
   const { t } = useTranslation();
   const settings = useSettingsStore((state) => state.settings);
@@ -544,6 +659,8 @@ export function MacSettingsPanel({
       return <TerminalPanel />;
     case "lsp":
       return <LspPanel />;
+    case "maven":
+      return <MavenPanel />;
     case "ai":
       return <AiPanel />;
     case "logs":

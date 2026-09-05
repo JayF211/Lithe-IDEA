@@ -620,6 +620,32 @@ export const settingsSearchIndex: SettingSearchRecord[] = [
     keywords: ["ai", "agent", "chat", "clear", "delete", "history"],
   },
 
+  // Maven Settings
+  {
+    id: "maven-settings-xml",
+    tab: "maven",
+    section: "Maven",
+    label: "settings.xml",
+    description: "Custom Maven settings.xml used for builds and language tooling",
+    keywords: ["maven", "settings", "xml", "repository", "mirror", "build"],
+  },
+  {
+    id: "maven-executable",
+    tab: "maven",
+    section: "Maven",
+    label: "Maven Home",
+    description: "Maven installation directory or executable used to launch builds",
+    keywords: ["maven", "mvn", "home", "executable", "installation", "build"],
+  },
+  {
+    id: "maven-jdk-home",
+    tab: "maven",
+    section: "Maven",
+    label: "Maven JDK Home",
+    description: "JDK used to run Maven builds",
+    keywords: ["maven", "jdk", "java", "home", "runtime", "build"],
+  },
+
   // Keyboard Settings
   {
     id: "keyboard-quick-file-open",

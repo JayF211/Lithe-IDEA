@@ -14,6 +14,7 @@ import {
   KeyboardIcon,
   MagicWandIcon,
   FileTextIcon,
+  PackageIcon,
   TerminalWindowIcon,
   type Icon,
 } from "@/ui/icons";
@@ -36,6 +37,7 @@ const categories: CategoryItem[] = [
   { id: "keyboard", labelKey: "settings.tabs.keyboard", icon: KeyboardIcon },
   { id: "terminal", labelKey: "settings.tabs.terminal", icon: TerminalWindowIcon },
   { id: "lsp", labelKey: "settings.tabs.lsp", icon: DatabaseIcon },
+  { id: "maven", labelKey: "settings.tabs.maven", icon: PackageIcon },
   { id: "ai", labelKey: "settings.tabs.aiCommit", icon: MagicWandIcon },
   { id: "logs", labelKey: "settings.tabs.logs", icon: FileTextIcon },
   { id: "updates", labelKey: "settings.tabs.updates", icon: ArrowClockwiseIcon },
@@ -46,6 +48,7 @@ function categoryFromRequestedTab(tab: SettingsTab | null): MacSettingsCategory 
     case "editor":
     case "keyboard":
     case "terminal":
+    case "maven":
     case "ai":
     case "logs":
       return tab;
