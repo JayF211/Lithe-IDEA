@@ -630,6 +630,14 @@ export const settingsSearchIndex: SettingSearchRecord[] = [
     keywords: ["maven", "settings", "xml", "repository", "mirror", "build"],
   },
   {
+    id: "maven-local-repository",
+    tab: "maven",
+    section: "Maven",
+    label: "Maven Local Repository",
+    description: "Local Maven repository directory used to cache build artifacts",
+    keywords: ["maven", "local", "repository", "cache", "artifacts", "repo", "build"],
+  },
+  {
     id: "maven-executable",
     tab: "maven",
     section: "Maven",

@@ -396,18 +396,21 @@ function MavenPanel() {
   const project = useMavenStore((state) => state.project);
   const projectStatus = useMavenStore((state) => state.projectStatus);
   const settingsPath = useMavenStore((state) => state.settingsPath);
+  const localRepositoryPath = useMavenStore((state) => state.localRepositoryPath);
   const mavenExecutablePath = useMavenStore((state) => state.mavenExecutablePath);
   const javaHomePath = useMavenStore((state) => state.javaHomePath);
   const configurationSaveError = useMavenStore((state) => state.configurationSaveError);
   const updateLocalConfiguration = useMavenStore((state) => state.actions.updateLocalConfiguration);
   const [draft, setDraft] = useState<MavenSettings>({
     settingsPath,
+    localRepositoryPath,
     mavenExecutablePath,
     javaHomePath,
   });
 
   const fields = [
     { field: "settingsPath" as const, label: "settings.xml", directory: false },
+    { field: "localRepositoryPath" as const, label: t("maven.localRepository"), directory: true },
     { field: "mavenExecutablePath" as const, label: t("maven.mavenExecutable"), directory: true },
     { field: "javaHomePath" as const, label: t("maven.javaHome"), directory: true },
   ];
@@ -415,11 +418,12 @@ function MavenPanel() {
   // Re-sync the draft when the persisted configuration changes, e.g. when the
   // Maven project finishes loading after the panel is already open.
   useEffect(() => {
-    setDraft({ settingsPath, mavenExecutablePath, javaHomePath });
-  }, [settingsPath, mavenExecutablePath, javaHomePath]);
+    setDraft({ settingsPath, localRepositoryPath, mavenExecutablePath, javaHomePath });
+  }, [settingsPath, localRepositoryPath, mavenExecutablePath, javaHomePath]);
 
   const dirty =
     draft.settingsPath !== settingsPath ||
+    draft.localRepositoryPath !== localRepositoryPath ||
     draft.mavenExecutablePath !== mavenExecutablePath ||
     draft.javaHomePath !== javaHomePath;
 
