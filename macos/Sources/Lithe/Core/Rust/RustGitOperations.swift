@@ -9,7 +9,7 @@ import LitheGitModule
 struct RustGitOperations: GitOperations, Sendable {
     let core: RustCoreBridge
 
-    private func makeProcessResult(_ response: RustCoreBridge.GitCommandPayload) -> GitProcessResult {
+    func makeProcessResult(_ response: RustCoreBridge.GitCommandPayload) -> GitProcessResult {
         GitProcessResult(
             arguments: response.arguments ?? [],
             output: response.operationError?.userMessage ?? response.output,
@@ -31,6 +31,21 @@ struct RustGitOperations: GitOperations, Sendable {
                     conflictedPaths: $0.conflictedPaths
                 )
             },
+            tagDeletion: response.tagDeletion.map {
+                GitTagDeletion(
+                    name: $0.name,
+                    deletedTarget: $0.deletedTarget,
+                    kind: $0.kind,
+                    message: $0.message
+                )
+            },
+            branchDeletion: response.branchDeletion.map {
+                GitBranchDeletion(
+                    name: $0.name,
+                    deletedTarget: $0.deletedTarget
+                )
+            },
+            historyRewrite: response.historyRewrite,
             warnings: response.warnings?.map {
                 GitOperationWarning(code: $0.code, message: $0.message, details: $0.details)
             } ?? []
@@ -135,6 +150,41 @@ struct RustGitOperations: GitOperations, Sendable {
         write(at: rootURL, operation: "reset", revision: hash, mode: mode)
     }
 
+    func historyRewritePreview(at rootURL: URL, operation: GitHistoryRewriteOperation, revisions: [String]) -> GitHistoryRewritePreview? {
+        switch core.gitHistoryRewritePreview(at: rootURL, operation: operation, revisions: revisions) {
+        case .success(let preview): return preview
+        case .failure(let error): return .failed(operation: operation, message: error.userMessage)
+        }
+    }
+
+    func rewriteHistory(at rootURL: URL, expectedState: GitHistoryRewriteExpectedState, message: String?) -> GitProcessResult? {
+        switch core.gitHistoryRewrite(at: rootURL, expectedState: expectedState, message: message) {
+        case .success(let response): return makeProcessResult(response)
+        case .failure(let error): return GitProcessResult(output: error.userMessage, exitCode: 1)
+        }
+    }
+
+    func createHistoryRecoveryBranch(named name: String, reference: String, at rootURL: URL) -> GitProcessResult? {
+        write(at: rootURL, operation: "createBranch", reference: reference, name: name, checkout: false)
+    }
+
+    func exportPatch(at rootURL: URL, source: GitPatchSource, paths: [String], base: String?, target: String?, metadataOnly: Bool) -> Result<GitPatchExport, GitPatchFailure> {
+        core.gitPatchExport(at: rootURL, source: source, paths: paths, base: base, target: target, metadataOnly: metadataOnly)
+            .mapError { GitPatchFailure($0.userMessage) }
+    }
+
+    func previewPatch(at rootURL: URL, patch: String, target: GitPatchTarget) -> Result<GitPatchPreview, GitPatchFailure> {
+        core.gitPatchPreview(at: rootURL, patch: patch, target: target)
+            .mapError { GitPatchFailure($0.userMessage) }
+    }
+
+    func applyExchangePatch(at rootURL: URL, patch: String, target: GitPatchTarget, expectedState: String) -> GitProcessResult? {
+        switch core.gitPatchApply(at: rootURL, patch: patch, target: target, expectedState: expectedState) {
+        case .success(let response): return makeProcessResult(response)
+        case .failure(let error): return GitProcessResult(output: error.userMessage, exitCode: 1)
+        }
+    }
+
     func createBranch(named name: String, from reference: GitReference, checkout: Bool, at rootURL: URL) -> GitProcessResult? {
         write(
             at: rootURL,
@@ -143,6 +193,59 @@ struct RustGitOperations: GitOperations, Sendable {
             name: name,
             checkout: checkout
         )
+    }
+
+    func createWorktree(
+        named name: String,
+        from reference: GitReference,
+        revision: String? = nil,
+        at destination: URL,
+        repositoryRoot: URL
+    ) -> GitProcessResult? {
+        write(
+            at: repositoryRoot,
+            operation: "createWorktree",
+            gitReference: reference,
+            revision: revision,
+            name: name,
+            destination: destination
+        )
+    }
+
+    func createWorktree(_ request: GitWorktreeCreation, at rootURL: URL) -> GitProcessResult? {
+        switch core.gitCreateWorktree(request, at: rootURL) {
+        case .success(let response): return makeProcessResult(response)
+        case .failure(let error): return GitProcessResult(output: error.userMessage, exitCode: 1)
+        }
+    }
+
+    func removeWorktree(
+        _ worktree: GitWorktree,
+        force: Bool,
+        at rootURL: URL
+    ) -> GitProcessResult? {
+        write(
+            at: rootURL,
+            operation: "removeWorktree",
+            destination: worktree.url,
+            force: force
+        )
+    }
+
+    func lockWorktree(_ worktree: GitWorktree, at rootURL: URL) -> GitProcessResult? {
+        write(at: rootURL, operation: "lockWorktree", destination: worktree.url)
+    }
+
+    func unlockWorktree(_ worktree: GitWorktree, at rootURL: URL) -> GitProcessResult? {
+        write(at: rootURL, operation: "unlockWorktree", destination: worktree.url)
+    }
+
+    func repairWorktrees(at rootURL: URL) -> GitProcessResult? {
+        write(at: rootURL, operation: "repairWorktrees")
+    }
+
+    func pruneWorktrees(at rootURL: URL) -> GitProcessResult? {
+        write(at: rootURL, operation: "pruneWorktrees")
     }
 
     func renameBranch(_ reference: GitReference, to name: String, at rootURL: URL) -> GitProcessResult? {
@@ -319,12 +422,49 @@ struct RustGitOperations: GitOperations, Sendable {
         write(at: rootURL, operation: "stageAll")
     }
 
+    func mutateLiteralLocalExcludePatterns(_ patterns: [String], adding: Bool, at rootURL: URL) -> GitProcessResult? {
+        write(
+            at: rootURL,
+            operation: adding ? "excludePatterns" : "unexcludePatterns",
+            paths: patterns
+        )
+    }
+
+    func createTag(
+        named name: String,
+        at revision: String,
+        message: String?,
+        rootURL: URL
+    ) -> GitProcessResult? {
+        write(
+            at: rootURL,
+            operation: "createTag",
+            revision: revision,
+            name: name,
+            message: message
+        )
+    }
+
+    func deleteTag(named name: String, rootURL: URL) -> GitProcessResult? {
+        write(at: rootURL, operation: "deleteTag", name: name)
+    }
+
     func snapshot(at rootURL: URL) -> GitSnapshot? {
         core.gitStatus(at: rootURL)?.makeSnapshot(at: rootURL)
     }
 
+    func repositories(in workspaceURL: URL) -> [URL] {
+        core.workspaceRepositories(at: workspaceURL)?.repositories.map {
+            URL(fileURLWithPath: $0.path).standardizedFileURL
+        } ?? []
+    }
+
     func watchContext(at rootURL: URL) -> GitWatchContext? {
         core.gitWatchContext(at: rootURL)?.makeContext()
+    }
+
+    func worktrees(at rootURL: URL) -> [GitWorktree]? {
+        core.gitWorktrees(at: rootURL)?.worktrees.map { $0.makeModel() }
     }
 
     func diffPatch(
@@ -432,6 +572,35 @@ struct RustGitOperations: GitOperations, Sendable {
             reference: reference?.fullName,
             limit: limit
         )?.makeSnapshot()
+    }
+
+    func references(at rootURL: URL, operationID: String) -> GitReferenceSnapshot? {
+        core.gitReferences(at: rootURL, operationID: operationID)?.makeSnapshot()
+    }
+
+    func historyPage(
+        at rootURL: URL,
+        reference: GitReference?,
+        cursor: String?,
+        limit: Int,
+        operationID: String
+    ) -> GitHistoryPage? {
+        core.gitHistoryPage(
+            at: rootURL,
+            reference: reference?.fullName,
+            cursor: cursor,
+            limit: limit,
+            order: "date",
+            operationID: operationID
+        )?.makePage()
+    }
+
+    func closeHistoryCursor(at rootURL: URL, cursor: String) -> Bool {
+        core.closeGitHistoryCursor(at: rootURL, cursor: cursor)
+    }
+
+    func cancel(operationID: String) -> Bool {
+        core.cancel(operationID: operationID)
     }
 
     func files(in commit: GitCommit, at rootURL: URL) -> [GitCommitFile]? {

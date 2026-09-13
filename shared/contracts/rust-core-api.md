@@ -67,6 +67,7 @@ stable error code and a user-facing message:
 | `community.discourse.categories` | List normalized visible categories |
 | `community.discourse.search` | Search normalized topics and sanitized posts |
 | `workspace.snapshot` | Enumerate visible workspace nodes and relative file paths |
+| `workspace.repositories` | Discover deterministic Git repository roots for an opened workspace |
 | `workspace.search` | Search visible file names and UTF-8 text files |
 | `workspace.searchEverywhere` | Search visible file names, Java types/methods, and UTF-8 text files |
 | `workspace.replacePreview` | Return deterministic replacement lines and complete replacement text |
@@ -81,7 +82,10 @@ stable error code and a user-facing message:
 | `history.delete` | Delete one history entry and its snapshot |
 | `maven.scan` | Parse a Maven project descriptor and recursively return modules/profiles |
 | `maven.launchPlan` | Produce a deterministic Maven invocation from a versioned project context |
+| `maven.dependencyPlan` | Produce a bounded dependency-tree invocation for one Maven module |
+| `maven.dependencies` | Normalize bounded Maven dependency-plugin output into a deterministic tree |
 | `maven.diagnostics` | Parse stable Maven compiler diagnostics from build output |
+| `maven.testResults` | Parse bounded JUnit/Surefire result summaries and failure locations |
 | `debug.createSession` | Create a transport-neutral DAP session and return its initialize frame |
 | `debug.launch` | Queue a launch or attach request, including during initialization |
 | `debug.javaTestLaunch` | Normalize JUnit or TestNG launch metadata into Java DAP arguments |
@@ -127,9 +131,11 @@ stable error code and a user-facing message:
 | `java.codeVision` | Return Java declaration usage counts for editor code vision |
 | `java.className` | Resolve a Java source package and simple name into a runtime class name |
 | `java.sourceDefinition` | Locate a Java type, method, or field declaration in source text |
+| `java.testMethods` | Discover JUnit 4/5 test methods and their source ranges |
 | `java.serverPort` | Parse Spring server port settings from properties or YAML text |
-| `java.structure` | Parse Java editor folds, inlay hints, and portable syntax roles |
+| `java.structure` | Parse Java editor folds, inlay hints, portable syntax roles, and JUnit test methods |
 | `spring.index` | Build a deterministic Spring configuration, bean, injection, and endpoint index |
+| `mybatis.index` | Build a deterministic MyBatis mapper-interface and XML statement index |
 | `runConfig.inspect` | Inspect `.lithe` run documents, versions, and staleness without writing files |
 | `runConfig.generate` | Generate deterministic Java/Maven configurations and toolchain requirements |
 | `runConfig.resolve` | Merge generated, project, and local layers and return diagnostics |
@@ -137,14 +143,26 @@ stable error code and a user-facing message:
 | `runConfig.saveEditorChanges` | Prepare the local and optional project documents for one editor save |
 | `runConfig.createUserConfiguration` | Validate a typed user configuration and return an updated document |
 | `runConfig.createLaunchPlan` | Project one effective configuration into a platform-neutral Run or Debug plan |
+| `git.repositorySetup` | Inspect repository/unborn state and scoped/effective commit identity; see `git-repository-setup.md` |
+| `git.initialize` | Initialize a directory outside existing repositories without staging or committing |
+| `git.configureIdentity` | Save or clear one local/global `user.name` or `user.email` override |
 | `git.status` | Resolve the repository, current branch, and working-tree changes |
 | `git.watchContext` | Resolve the repository and absolute Git metadata roots needed by native file watchers |
+| `git.worktrees` | Return deterministic registered-worktree metadata without scanning each checkout |
 | `git.pullRequestContext` | Resolve worktree-aware PR branch defaults, publication state, and uncommitted-change state |
 | `git.command` | Execute one argument-based Git operation and return its arguments, streams, exit code, and ordered subprocess invocations |
 | `git.write` | Validate and execute shared Git mutations such as stage, commit, branch, checkout, remote sync, clone, and stash |
+| `git.historyRewritePreview` | Review undo, message edit, squash, or drop with complete messages, eligibility, and an immutable checkout expectation |
+| `git.rebasePreview` | Resolve the complete local linear range strictly after a selected unchanged base |
+| `git.rebaseStart` | Start a reviewed native interactive rebase with persisted messages and recovery identity |
+| `git.rebaseSession` | Read the latest owned rebase session and distinguish edit/conflict pauses from completion |
+| `git.rebaseControl` | Continue, skip, or abort an identified session, optionally amending an edit pause |
 | `git.diff` | Produce a structured working-tree, index, reference, or commit patch |
 | `git.apply` | Apply or check a patch in `stage`, `unstage`, `discard`, or Shelf restore mode |
-| `git.history` | Return deterministic refs, recent local branches, commits, parent hashes, decorations, and pagination state |
+| `git.history` | Return the legacy combined reference snapshot and first bounded commit page |
+| `git.references` | Return deterministic refs, recent local branches, ahead/behind state, and effective Git identity without scanning commit history |
+| `git.historyPage` | Return one bounded commit page, parent hashes, decorations, and an opaque continuation cursor |
+| `git.historyCursorClose` | Release an unfinished incremental history cursor and its Git process |
 | `git.pushPreview` | Resolve a local branch push destination and the bounded commits not present on that remote base |
 | `git.commit` | Return one structured commit by revision |
 | `git.commitFiles` | Return files changed by one commit |
@@ -159,12 +177,79 @@ stable error code and a user-facing message:
 | `github.parseRemote` | Parse a canonical GitHub HTTPS or SSH remote into owner/name |
 | `github.requestPlan` | Validate one GitHub operation and produce a trusted platform HTTP request plan |
 | `github.normalizeResponse` | Normalize raw GitHub JSON and HTTP status into deterministic data or a stable error |
+| `diagnostics.redactText` | Redact credentials, tokens, and home-directory paths from diagnostic-bundle text |
+| `diagnostics.buildManifest` | Shape a deterministic diagnostic bundle manifest from host-gathered environment and file facts |
+
+### Maven test results
+
+`maven.testResults` accepts `{ "root": string, "output": string }` and parses
+the bounded text emitted by Maven Surefire or Failsafe after a JUnit 4/5 class
+or method run. `root` must be an existing workspace directory and `output` is
+limited to 500,000 characters. The response is:
+
+```json
+{
+  "testsRun": 4,
+  "failures": 1,
+  "errors": 1,
+  "skipped": 1,
+  "passed": 1,
+  "success": false,
+  "failureDetails": [
+    {
+      "name": "additionIsCorrect(com.example.CalculatorTest)",
+      "kind": "failure",
+      "message": "expected <4> but was <5>",
+      "path": "src/test/java/com/example/CalculatorTest.java",
+      "line": 42,
+      "column": null
+    }
+  ]
+}
+```
+
+`kind` is `failure` or `error`; `path` is a workspace-relative source path
+when a stack frame or failure footer can be resolved unambiguously. Relative
+source lookup requires a complete workspace index, prefers a unique full
+package-path suffix at a path boundary, and falls back to a unique filename
+only when no package-path candidate exists. Ambiguous matches or an incomplete
+scan (including the 10,000-directory limit) leave the location `null`.
+All locations use one-based lines with nullable columns. `passed` is derived from the summary and never
+negative. A final `Results` summary is preferred; when Maven only prints
+per-class summaries, the counts are aggregated. Failure details retain Maven's output order and are bounded to
+10,000 entries. A parser or size violation returns the standard
+`parse_failed` error. Platform stores must associate the response with the
+launch operation and discard it after cancellation, replacement, or workspace
+change.
 
 Workspace paths in responses are relative and use `/` separators. Line numbers
 are one-based. `git.status.repositoryRoot` may be an absolute path when the
 opened workspace is a subdirectory of the repository; all Git change paths are
 relative to that repository root. `git.status.ahead` and `behind` report the
 current branch's tracking counts and are zero when no upstream is configured.
+`workspace.repositories.repositories` is ordered with the containing workspace
+repository first when present, then repositories under the opened workspace by
+workspace containment, depth, and path. Each entry contains an absolute native
+`path` because repository roots are platform boundary values and may be outside
+the opened folder when the folder is nested inside a checkout. Canonical paths
+are reported in plain native form: Core strips the Windows verbatim `\\?\`
+prefix so roots remain valid Git working directories and stay resolvable after
+consumers normalize separators. Core treats both
+`.git` directories and `.git` files as repository markers. The default traversal
+visits the entire workspace tree, including build and dependency folders, and
+continues below discovered repositories. Git metadata itself is not traversed.
+Symbolic directory links are not followed, preventing cycles and traversal
+outside the workspace. Callers may explicitly supply `maxDirectories` and
+`maxDepth` to request a bounded scan; product consumers omit these limits.
+Traversal checks cancellation between directories and entries.
+`git.worktrees.worktrees` is ordered with the primary worktree first and then
+by path. Each entry contains `path`, `head`, nullable `branch`, `isCurrent`,
+`isPrimary`, `isBare`, `isDetached`, `isLocked`, nullable `lockReason`,
+`isPrunable`, and nullable `pruneReason`. The path is absolute because linked
+worktrees may live outside the opened workspace; clients must treat it as an
+opaque native boundary value and must not persist it as a portable identifier.
+Core reads the list with one porcelain operation and does not run status in
+each checkout.
 For a rename or copy, each change uses the destination as `path` and preserves
 the source as `originalPath`; platform mutations that act on the Git entry pass
 both paths back to Core.
@@ -244,33 +329,65 @@ validation or probe fails after at least one subprocess was recorded, the
 response retains the invocation trace and includes the failure as
 `operationError`.
 
+`git.command` and typed Git writers share the repository's write lease, including
+linked worktrees. A competing request fails with `invalid_request` while a writer
+is active; it does not wait behind a mutex outside its cancellation deadline.
+
 `git.write` accepts a typed mutation request. Its required `operation` values are
-`stage`, `unstage`, `discard`, `discardAll`, `stageAll`, `commit`, `ignore`, `exclude`, `cherryPick`, `revert`,
-`reset`, `editCommitMessage`, `deleteCommit`, `squashCommits`, `createBranch`, `publishBranch`,
-`renameBranch`, `setUpstream`, `unsetUpstream`, `deleteBranch`, `merge`, `rebase`, `createWorktree`,
+`stage`, `unstage`, `discard`, `discardAll`, `stageAll`, `commit`, `ignore`, `exclude`, `excludePatterns`, `unexcludePatterns`, `cherryPick`, `revert`,
+`reset`, `undoCommit`, `editCommitMessage`, `deleteCommit`, `squashCommits`, `createBranch`, `publishBranch`,
+`renameBranch`, `setUpstream`, `unsetUpstream`, `deleteBranch`, `updateBranch`, `merge`, `rebase`, `createWorktree`,
+`removeWorktree`, `lockWorktree`, `unlockWorktree`, `repairWorktrees`, `pruneWorktrees`,
 `fetch`, `pull`, `push`, `checkout`, `checkoutAndRebase`, `checkoutRevision`, `clone`, `stashPush`,
 `stashApply`, `stashPop`, `stashDrop`, `deleteRemoteBranch`, `operationContinue`,
-`operationAbort`, and `operationSkip`. Optional fields are `paths`, `reference`, `referenceKind`,
+`operationAbort`, `operationSkip`, `createTag`, and `deleteTag`. Optional fields are `paths`, `reference`, `referenceKind`,
 `gitReference`, `revision`, `revisions`, `name`, `message`, `remote`, `destination`, `mode`,
-`includeUntracked`, `checkout`, `amend`, `force`, `pushTags`, `expectedPush`, and `autoStash`.
+`includeUntracked`, `checkout`, `amend`, `force`, `pushTags`, `expectedPush`, `autoStash`,
+`worktreeMode`, `noCheckout`, and `expectedState`. The four history actions require the reviewed `expectedState`
+described below; earlier unreviewed history-write callers must migrate.
 
 The core validates pathspecs, revisions, branch names, references, reset modes,
 stash references, and operation-specific required fields before invoking Git.
 `setUpstream` requires a typed remote `gitReference` and passes its complete
 `refs/remotes/*` identity to Git, so a same-named local branch cannot make the
-upstream ambiguous. `createWorktree` likewise requires a typed reference; for a
-remote reference Core executes one `git worktree add --track -b` mutation using
-the complete remote ref, so branch creation, checkout, and tracking setup do not
-form separate platform-visible success states.
+upstream ambiguous. `createWorktree` accepts `worktreeMode` values `newBranch`
+(the backward-compatible default), `existingBranch`, and `detached`.
+`newBranch` requires `name` and a typed `gitReference`, with an optional
+`revision` override. A remote base without a revision override uses one
+`git worktree add --track -b` mutation so creation and tracking have one Git
+outcome. Explicit revisions resolve to immutable OIDs and use `--no-track`;
+local and tag bases also use `--no-track`, independently of
+`branch.autoSetupMerge`. `existingBranch`
+requires a typed local branch and rejects `name` and `revision`; it passes the
+validated branch identity without `-b`, leaving Git to reject an already
+occupied branch. `detached` rejects `name` and requires a typed reference or
+`revision` (the latter takes precedence), resolves it to an immutable commit,
+and uses `--detach`. Independent `noCheckout: true` adds `--no-checkout` in
+every mode; its default is false, and legacy `checkout` does not control
+worktree file population. Examples are in
+`shared/fixtures/git/worktree-creation-v1.json`. Worktree mutations re-read Git's
+registered list and reject arbitrary paths. Removal rejects the current,
+primary, or locked worktree; dirty worktrees require an explicit `force` value.
+`repairWorktrees` refreshes administrative links after a repository or worktree
+has moved. `pruneWorktrees` removes registrations whose checkout is already missing and
+does not recursively delete an arbitrary directory.
+
+`updateBranch` requires a typed, non-current local `gitReference`. Core resolves
+that branch's configured remote upstream and performs an atomic Fetch that
+refreshes the remote-tracking ref and fast-forwards the local branch without
+switching HEAD. Git rejects diverged branches and branches checked out by any
+worktree, so the operation cannot discard local commits or mutate another active
+checkout.
 Successful process launch returns `{ "arguments": string[], "output": string,
 "stdout": string, "stderr": string, "exitCode": number, "invocations":
 GitCommandInvocation[], "operationError": CoreError?, "stashRestore":
-GitStashRestore?, "warnings": GitOperationWarning[] }` even when Git exits non-zero.
+GitStashRestore?, "historyRewrite": GitHistoryRewriteResult?, "warnings": GitOperationWarning[] }`
+even when Git exits non-zero.
 `GitOperationWarning` is `{ "code": string, "message": string, "details"?: string }`
 and reports a non-fatal follow-up failure after the requested mutation already
 succeeded. Platform clients must retain the successful operation outcome while
 presenting the warning. The top-level process fields
-always describe the final subprocess, and `output` is that subprocess's
+normally describe the final subprocess, and `output` is that subprocess's
 `stdout` followed by `stderr`. `invocations` records every Git subprocess for
 composite operations such as `discardAll` and Smart Checkout in execution
 order; each item contains the exact argument vector (excluding the executable
@@ -354,7 +471,19 @@ the legacy behavior of committing the existing index. `ignore` appends root-anch
 repository's top-level `.gitignore`; `exclude` appends the same patterns to the
 worktree-aware Git metadata path for `info/exclude`. Both ignore operations
 preserve existing content, escape Git pattern characters, de-duplicate rules,
-and interpret a trailing `/` as a directory rule.
+and interpret a trailing `/` as a directory rule. `excludePatterns` and
+`unexcludePatterns` mutate exact literal lines in that same worktree-aware
+`info/exclude` file without root-anchoring or escaping, so recommended IDE
+patterns such as `.factorypath` can be added or removed once. Existing lines are
+compared as stored raw bytes, including leading and trailing whitespace and
+non-UTF-8 content; a leading space is a different Git ignore rule and is neither
+treated as a duplicate on add nor removed as the same rule. Unrelated lines keep
+their original bytes; add appends without rewriting the existing file, and
+remove rebuilds from the original line bytes and terminators rather than
+decoding the file as UTF-8. Request values are trimmed and rejected when empty or
+when they contain NULs or line breaks. Remove is a no-op when managed lines are
+absent. A non-repository root fails with `invalid_request` / `Not a Git
+repository`.
 
 `editCommitMessage` rebuilds the selected commit and its later first-parent
 descendants with the new `message`. `squashCommits` requires at least two
@@ -365,7 +494,108 @@ non-root commit and replays later commits; deleting HEAD resets to its parent.
 All three operations reject a dirty worktree, detached HEAD, an active Git
 operation, a target outside the current branch's first-parent chain, a rewrite
 range containing a merge commit, or any rewritten commit reachable from
-`refs/remotes`.
+`refs/remotes`. They also reject any signed commit in the affected range, so
+the existing unsigned `commit-tree` execution cannot silently strip a signature.
+Their complete messages must be UTF-8. Root-commit message edits and squash
+ranges that include the root remain supported; root deletion is rejected.
+
+`undoCommit` accepts one `revision` that must resolve to the checked-out local
+branch's HEAD with exactly one parent. It atomically moves that branch to the
+parent while preserving the index bytes and working files, including existing
+staged, unstaged, and untracked edits. It rejects root and merge commits,
+detached HEAD, unresolved conflicts, an active Git operation, and a HEAD known
+to be reachable from remote-tracking refs. Undo may preserve a signed HEAD
+because it moves a ref without reconstructing or modifying that commit object.
+
+Native interactive rebases use the dedicated preview/start/session/control
+contract in [git-rebase-session.md](git-rebase-session.md). The base selected
+for “Rebase from Here” remains unchanged; only its successors are rewritten.
+
+`git.historyRewritePreview` accepts `{ "root": string, "operation": string,
+"revisions": string[] }` for those four operations. It returns `operation`,
+`allowed`, `blockers` (`{ "code": string, "message": string }[]`), nullable
+`branch` and `head`, `selectedCommits`, `affectedCommits`, `suggestedMessage`,
+and nullable `expectedState`. Each commit has a full `hash`, `parents`, and its
+complete, untrimmed `message`; both commit lists are oldest first, independently
+of UI sorting, filtering, or pagination. Squash's suggested message combines
+all selected messages in that order. The preview permits at most 1000 affected
+commits; an out-of-range selection is explicitly blocked rather than truncated.
+`affectedCommits` covers later descendants whose OIDs change as well as the
+selection. Remote reachability uses local `refs/remotes`, including descendants;
+it is not a live server claim that a commit has never been published.
+
+An actionable preview contains `expectedState` as `{ "branch": string,
+"head": string, "stateToken": string, "operation": string, "revisions": string[] }`.
+Callers return this object unchanged in `git.write`, using its selected full
+OIDs in the normal `revision` or `revisions` fields. The optional edited
+`message` is separately validated without silently trimming its contents.
+Core normalizes subdirectory roots to the repository root. Its opaque token
+covers checkout identity and symbolic HEAD, local/remote/tag refs, exact index
+contents, working-file diffs, untracked-file contents, and active operation
+state. Core repeats eligibility and snapshot checks before preparation and
+again before the expected-OID ref update. Changed previews fail with
+`invalid_request` and a stale-preview message. Typed Git writers, including
+index patch operations, share a repository-wide in-process lease across linked
+worktrees; external Git writers remain subject to snapshot and OID checks.
+
+Before altering the branch, Core creates a persistent ref beneath
+`refs/lithe/history-recovery/` at the original HEAD. Its reflog records the
+operation, original branch and HEAD so the point remains attributable after a
+process restart. At most the newest 20 recovery refs are retained after
+successful cleanup; cleanup failure is explicit. These internal refs are
+excluded from ordinary reference lists and unfiltered Git history, including
+decorations. A host can use the recovery OID/ref with the existing `createBranch`
+operation to preserve or inspect the old history without resetting working files.
+
+After a recovery point exists, the response retains `historyRewrite` as
+`{ "operation": string, "branch": string, "originalHead": string, "newHead":
+string | null, "recoveryReference": string, "mutationApplied": boolean,
+"outcomeKnown": boolean, "worktreeRefresh": "notNeeded" | "ready" | "failed" }`.
+`newHead` is the prepared target when one exists, even if its installation failed.
+`mutationApplied` is true only after successful installation or observation;
+when interrupted outcome inspection also fails, `outcomeKnown` is false and
+the user must inspect recovery before retrying. Clients must not infer that
+nothing happened from a cancellation or generic error. Drop replays against an
+isolated index before moving the ref; replay failure leaves real checkout state
+unchanged. After a successful ref update, a guarded two-tree checkout refresh
+does not move HEAD again. Refresh failure yields `git_worktree_refresh_failed`
+while preserving `mutationApplied: true` and the recovery point. For these
+structured responses, compatibility process fields describe the authoritative
+mutation result instead of a later recovery-cleanup subprocess; diagnostics
+remain available in `invocations`, `operationError`, and `warnings`.
+The compatibility fixture is `shared/fixtures/git/history-rewrite-v1.json`.
+
+`createTag` uses `name` for the new tag, `revision` as its target commit or
+revision, and an optional `message`: when the field is present (including an
+empty value), it creates an annotated tag (`git tag -a`); an absent field
+creates a lightweight tag. UI callers trim new user-entered messages. Core
+passes the supplied annotation with verbatim cleanup so restore preserves
+CRLF and trailing blank lines, and an explicit empty value preserves an empty
+annotated tag. Tag names must satisfy the `git check-ref-format` refname rules and must not
+begin with a dash; `shared/fixtures/git/tag-names.json` pins the boundary cases
+for Core and host-side validation. Before invoking Git, `createTag` probes the
+repository so a duplicate tag (`A tag named '<name>' already exists`) and an unresolvable
+non-commit target (`Could not resolve tag target '<rev>'`) fail with stable
+`invalid_request` messages instead of localized Git output. `deleteTag` uses
+`name` and removes `refs/tags/<name>`; a missing tag fails with
+`The tag '<name>' does not exist`. On success the response carries a
+structured `tagDeletion` record — `{ "name": string, "deletedTarget": string,
+"kind": "lightweight" | "annotated", "message": string? }` — where
+`deletedTarget` is the peeled commit the deleted ref resolved to and
+`message` is the original annotation with its line breaks preserved. Hosts
+can rebuild the tag by replaying `createTag` with `name`, `deletedTarget`,
+and `message`; the tagger identity and timestamp are intentionally not
+preserved. Deletion supplies the observed unpeeled object ID to `update-ref`,
+so a concurrent force-update fails atomically instead of deleting new state and
+returning a stale recovery target. `deleteBranch` applies the same expected-OID
+guard after checking the branch is fully merged and not checked out, then
+on success, carries a structured `branchDeletion` record —
+`{ "name": string, "deletedTarget": string }` — so hosts can offer to
+recreate the branch at its previous commit; a missing branch fails with
+`The branch '<name>' does not exist`. If the ref deletion succeeds but branch
+configuration cleanup fails, the response contains both `branchDeletion` and a
+`branch_config_cleanup_failed` warning; hosts must preserve the Restore action while surfacing the
+cleanup diagnostic.
 
 `operationContinue`, `operationAbort`, and `operationSkip` inspect Git metadata
 to select the active merge, rebase, cherry-pick, or revert instead of accepting
@@ -437,14 +667,45 @@ worktree. Pathspecs must be workspace-relative and must not contain absolute
 paths or `..` components.
 
 `git.history` accepts `root`, an optional full `reference`, and `limit` (the
-core clamps it to `1...5000`). It returns `references`, `commits`, `hasMore`,
-and the optional effective `userName` and `userEmail` from repository Git
-configuration. Commit parents are explicit so clients can render merge
-topology without re-parsing Git output. The identity fields let clients
-implement a stable `me` filter without guessing from recent commits.
-Each local reference with an upstream also returns numeric `ahead` and `behind`
-counts against that fetched remote-tracking reference. References without an
-upstream, remote references, and tags return zero for both fields.
+core clamps it to `1...5000`). It remains the compatibility command that
+combines `git.references` with the first `git.historyPage`. New clients use
+`git.references` with `{ "root": string }` and request commits separately with
+`git.historyPage` using `root`, optional full `reference`, nullable opaque
+`cursor`, `limit`, and optional `order` (`"topo"` or `"date"`). Omitted
+`order` preserves the original `git log --topo-order` behavior. `"date"` uses
+`git log --date-order`: committer date descending whenever the child-before-
+parent constraint permits, independently of the displayed author date. macOS
+requests date order for the log page and repository graph; existing clients
+retain topology order. A cursor is bound to its root, reference, and order;
+continuations must repeat the same order. A mismatched order returns
+`invalid_request` without consuming the cursor. The portable request example is
+`shared/fixtures/git/history-page-date-request-v1.json`.
+The first request omits `cursor`; each later request
+returns the prior page's `nextCursor`. Core keeps one bounded, backpressured
+`git log` stream behind that cursor and clamps the stream to the first 5,000
+commits, so later pages continue traversal instead of replaying earlier commits.
+A history page returns `commits`, nullable `nextCursor`, and `hasMore`. Clients
+call `git.historyCursorClose` with `root` and `cursor` when abandoning an
+unfinished stream, and discard and close a late page when its repository,
+selected reference, or owning `operationId` is stale. Core also expires idle
+cursors and caps the number of live streams. Commit parents are explicit so
+clients can render merge topology without re-parsing Git output. The optional
+effective `userName` and `userEmail` returned by `git.references` let clients
+implement a stable `me` filter without guessing from recent commits. Each
+reference includes `peelsToCommit`; hosts use it to disable commit-only
+actions for legal tree/blob tags before the user reaches a failing mutation.
+Each local
+reference with an upstream also returns numeric `ahead` and `behind` counts
+against that fetched remote-tracking reference. References without an upstream,
+remote references, and tags return zero for both fields. Portable examples are
+`shared/fixtures/git/references-response-v1.json` and
+`shared/fixtures/git/history-page-response-v1.json`.
+
+For compatibility, a request that explicitly contains the deprecated numeric
+`offset` field still uses the bounded offset implementation and returns
+`nextOffset`; it honors the same optional `order`. New clients must omit
+`offset`; repository size does not select
+between the two protocols.
 
 `git.commit` accepts `root` and a revision, returning one `commit` object.
 `git.blame` accepts `root` and a workspace-relative `path`; its line numbers
@@ -675,11 +936,36 @@ Java callers may also provide the versioned `mavenContext` accepted by
 publishes `settingsPath` through
 `java.configuration.maven.userSettings`, and, after `ServiceReady`, sends one
 `java.project.updateSettings` command per Maven project with
-`org.eclipse.m2e.core.selectedProfiles`. The session becomes `ready` only after
-every command succeeds; a command error or timeout terminates the session with
-`mavenContextFailed` or `mavenContextTimeout` at the `serviceReady` stage.
-`initializeTimeoutMilliseconds` bounds only the standard LSP handshake. For a
-provider such as JDT LS that has a later readiness signal,
+`org.eclipse.m2e.core.selectedProfiles`. Maven Java, test, and generated source
+roots are normalized to workspace-relative `java.project.sourcePaths` during
+the same configuration flow, so JDT LS receives the selected reactor's source
+model without platform-specific POM parsing. Maven profile application is a
+bounded background task: at most eight project commands are in flight, remaining
+projects are queued, and each project reports `running`, `succeeded`, or
+`failed` with optional error details. Project results use a redacted stable
+`projectUri` identifier; they never expose the user's absolute workspace path.
+The runtime event also carries the aggregate Maven task status (`running`,
+`succeeded`, `partiallySucceeded`, `failed`, `timedOut`, or `cancelled`) so hosts
+do not need to infer task completion from log text. A project failure or task timeout does not
+terminate an otherwise usable JDT LS session; the host receives a partial-failure
+event and may retry. The session reaches `ready` after JDT LS `ServiceReady`.
+Core only accepts retries for a ready Java session. A timeout sends `$/cancelRequest`
+but retains each in-flight slot until its terminal response arrives. Retry is
+rejected while the previous batch is still stopping; if JDT LS never responds,
+the user must restart the Java session. Late responses release those slots
+without changing the timed-out results.
+Hosts reset project results on the structured `mavenProfileTask: "running"`
+event and consume `mavenProfileProject` updates directly, scoped to the current
+session. Java import completion and Maven task completion use separate UI
+notifications so service readiness cannot overwrite a Maven failure.
+The session continues to expose profile progress independently. `initializeTimeoutMilliseconds`
+only bounds the standard LSP handshake. For a provider such as JDT LS that has
+a later readiness signal,
+the profile task records a deterministic digest of Maven settings, selected
+profiles, project URIs, and source paths; an unchanged successful digest skips
+reapplying the same settings, while an explicit retry invalidates that digest.
+Hosts may consume lifecycle events for the shared `serverConnected`,
+`projectImporting`, `profileApplying`, and `fullyReady` phases.
 `serviceReadyIdleTimeoutMilliseconds` bounds time without changed work-done
 progress and `serviceReadyAbsoluteTimeoutMilliseconds` is the final safety cap.
 The defaults are 45 seconds idle and 10 minutes absolute; duplicate progress
@@ -739,9 +1025,15 @@ only the current workspace/fingerprint directory; they do not clear sibling
 workspaces or older structural states.
 
 `java.workspacePolicy` accepts `workspacePaths` and `changedPaths` as
-workspace-relative paths. It starts Java tooling when any non-ignored `.java`
-source exists, regardless of Maven or Gradle metadata, chooses one deterministic
-representative source, and classifies changes as `ignored`, `source`,
+workspace-relative paths. It starts Java tooling when a non-ignored `.java`
+source exists and the workspace shows evidence of being a Java project: a build
+descriptor (`pom.xml`, `build.gradle[.kts]`, `settings.gradle[.kts]`, a Maven or
+Gradle wrapper) no more than two directories below the root, or a `.java` source
+no more than two directories below the root for projects that have no build
+system. A Java sample or fixture checked into a repository of another ecosystem
+therefore does not activate Java tooling; hosts still start a language server on
+demand when the user opens a `.java` file. The command chooses one deterministic
+representative source and classifies changes as `ignored`, `source`,
 `buildConfiguration`, or `other`. The compatibility examples are in
 `shared/fixtures/lsp/java-workspace-policy-v1.json`.
 
@@ -837,8 +1129,23 @@ with `/`-normalized lexical paths breaking ties, until one parses successfully;
 a malformed candidate does not hide a valid nested project. A project response
 contains its workspace `relativePath`,
 `groupId`, `artifactId`, `version`, `packaging`, recursive `modules`, `profiles`,
-and `hasWrapper`. Module paths are relative to the selected Maven root and use
-`/` separators. Malformed XML returns `parse_failed`.
+and `hasWrapper`. The root project and every recursive module also contain a
+`sourceRoots` list. Each entry has a module-relative `/`-normalized `path` and
+a `kind` of `mainJava`, `mainResources`, `testJava`, `testResources`,
+`generatedMain`, or `generatedTest`. Standard Maven roots are returned before
+their directories exist; explicit `<build>` source/resource directories and
+`maven-compiler-plugin` generated-source directories or
+`build-helper-maven-plugin` source lists replace the corresponding defaults,
+whether configured directly on the plugin or within an execution.
+`${project.build.directory}` resolves from `<build><directory>` and defaults to
+`target` only when that element is absent; unresolved or invalid explicit
+values do not silently fall back.
+Absolute, unresolved-property, and parent-traversal paths are omitted so one
+module cannot claim another module's source root. Entries are de-duplicated and
+ordered by the documented kind order, then path. Aggregator-only `pom` modules
+have no default roots. Module paths are relative to the selected Maven root and
+use `/` separators. Malformed XML returns `parse_failed`. Source-root examples
+are in `shared/fixtures/maven/source-roots-v1.json`.
 
 `maven.launchPlan` accepts a workspace `root`, a versioned `context`, an
 optional reactor-relative `module`, and an ordered `goals` array whose first
@@ -846,19 +1153,39 @@ entry is a lifecycle or custom goal. Later entries may be ordinary Maven CLI
 arguments such as `-Dname=value` or `-q`. They remain separate process arguments
 and are never interpreted by a shell. Context version 1 contains the
 workspace-relative `reactorPath`,
-selected `profiles`, optional platform-local `settingsPath`, `skipTests`, and
-optional Maven/JDK paths used only for the configuration fingerprint. The
-response contains the `project-maven` toolchain reference, an argument array,
-the workspace-relative reactor working directory, and a deterministic SHA-256
-configuration fingerprint. Profiles are sorted and de-duplicated. Module plans
-from `maven.launchPlan` use `-pl <module> -am`; Run and Debug plans use
-`-pl <module>` without `-am`. Settings use `-s`; skipped tests use
+selected `profiles`, optional platform-local `settingsPath` and
+`localRepositoryPath`, `skipTests`, and optional Maven/JDK paths used only for
+the configuration fingerprint. The response contains the `project-maven`
+toolchain reference, an argument array, the workspace-relative reactor working
+directory, and a deterministic SHA-256 configuration fingerprint. Profiles are
+sorted and de-duplicated. Module plans from `maven.launchPlan` and Maven-backed
+Run and Debug plans use `-pl <module> -am`. Settings use `-s`; a local
+repository override uses `-Dmaven.repo.local=<path>`; skipped tests use
 `-DskipTests`. Explicit Run `cwd`, Profiles, and `extensions.maven.skipTests`
-values override the project context, including `skipTests: false`.
-The core never reads `settings.xml` and never copies its path into a portable
-project document. Maven itself continues to read `.mvn/maven.config`; the plan
-does not expand or duplicate that file's arguments. Fixtures are in
+values override the project context, including `skipTests: false`. The core
+never reads `settings.xml` and never copies its path into a portable project
+document. Maven itself continues to read `.mvn/maven.config`; the plan does not
+expand or duplicate that file's arguments. Fixtures are in
 `shared/fixtures/maven/launch-plan-v1.json`.
+
+`maven.dependencyPlan` accepts the same workspace `root`, versioned `context`,
+and optional reactor-relative `module`. It returns a launch plan for the fixed
+`maven-dependency-plugin:3.8.1:tree` goal with verbose text output, disabled
+color, and an English locale. Module queries use `-pl <module>` without `-am`;
+the read-only query does not build reactor dependencies. Platform adapters own
+the child process, apply a bounded timeout, and keep it independent from an
+ordinary Maven build session.
+
+`maven.dependencies` accepts `{ "modulePath": string, "output": string }` and
+returns the normalized module path plus a recursively nested `dependencies`
+array. Each node contains `modulePath`, `groupId`, `artifactId`, `version`,
+`type`, nullable `classifier`, `scope`, `resolution`, nullable
+`selectedVersion`, and `children`. Resolution is `resolved`,
+`omittedDuplicate`, or `omittedConflict`. Core removes ANSI control sequences
+and unrelated Maven log lines, then sorts every level deterministically. Input
+is limited to 500,000 Unicode scalar values, 10,000 dependency nodes, and 64
+levels; malformed or excessive output returns `parse_failed`. The compatibility
+fixture is `shared/fixtures/maven/dependency-tree-v1.json`.
 
 `maven.diagnostics` accepts `{ "root": string, "output": string }` and returns
 `{ "issues": [] }`. Diagnostic paths may be absolute or workspace-relative;
@@ -900,6 +1227,17 @@ states, the effective global `toolchain`, and the machine-local
 `localToolchains` document. Toolchain diagnostics carry the affected run
 configuration ID when a requirement is consumed by one or more configurations;
 requirements with no configuration consumer do not emit a blocking diagnostic.
+For detected Maven configurations, resolved `extensions.maven.reactorPath`
+contains the workspace-relative reactor from the generated layer, independently
+of an overridden effective `cwd`. Core derives this read-only ownership value
+when resolving existing generated documents as well; regeneration is not
+required. Overrides cannot move a configuration to another reactor. Current
+File and configurations without detected Maven ownership omit this field.
+Module menus first match reactor and module, then apply the default preference;
+they must not infer ownership from an overridden working directory. The shared
+`run-configuration/maven-module-ownership.json` fixture covers independent
+reactors, cwd overrides, and the ordinary Java main / Current File capabilities.
+
 A process detector declares a runtime binding only when that command genuinely
 consumes the runtime. npm, pnpm, and Yarn scripts consume `project-node`; Bun
 scripts keep their independent `bun` command and do not acquire a Node
@@ -970,7 +1308,8 @@ the resolved Run Configuration replace the context profiles; otherwise the
 project profiles are inherited. Explicit `extensions.maven.skipTests` and
 `cwd` values also replace the context values. Core applies the shared settings,
 module, Skip Tests, and reactor-working-directory rules to the generated
-framework or Java-main arguments without adding tool-window-only `-am`. It
+framework or Java-main arguments, including `-am` for selected reactor
+modules. It
 returns a toolchain
 reference, argument array, project-relative working directory, and structured
 environment references. It does not return a shell command or platform
@@ -990,11 +1329,19 @@ name.
 `memberName`, returning zero-based `line` and UTF-16 `utf16Column` or `null`
 when no declaration is found.
 
+`java.testMethods` accepts Java `source` and returns `methods` in source order.
+Each method contains its `name` plus zero-based `line` and `endLine` values for
+the complete method body. The lightweight parser recognizes JUnit 4 and JUnit 5
+test annotations, ignores annotations and braces inside comments, strings,
+characters, and text blocks, and does not start a Java process or contact JDT.
+
 `java.structure` accepts Java `source` and optional `declarationSources`. It
-returns `foldRegions`, `inlayHints`, and
-`syntaxHighlights`. Line numbers are zero-based because these values are editor
+returns `foldRegions`, `inlayHints`, `syntaxHighlights`, and `testMethods`.
+Fold and inlay line numbers are zero-based because these values are editor
 offsets; UTF-16 columns and hidden ranges match the native text editor coordinate
-system. Syntax highlights contain document-relative `utf16Start`,
+system. Each JUnit 4/5 test method contains its name plus inclusive one-based
+`line` and `endLine` values and comes from the Java syntax tree, so comments and
+method calls cannot create runnable test entries. Syntax highlights contain document-relative `utf16Start`,
 `utf16Length`, and a role from the shared editor syntax-theme contract. They
 are sorted and non-overlapping, so native renderers can apply semantic colors
 without maintaining another Java parser. The parser is platform-independent
@@ -1023,3 +1370,52 @@ Dependency metadata is cached in the Rust process. Project-open indexing sets
 it `false`, so editing Java or configuration files does not repeatedly traverse
 and open the local dependency repository. The repository path is selected by
 the platform composition layer and is never persisted in shared results.
+
+`mybatis.index` accepts `root`, workspace-relative `paths`, and optional
+`textOverrides` keyed by relative path. It pairs Java mapper types with XML
+`<mapper namespace>` documents and returns only statements that have both a
+Java method and a matching XML `select`/`insert`/`update`/`delete` `id`.
+Results are deterministically ordered by namespace, statement id, XML path,
+and line. Locations use relative paths and one-based lines and columns.
+`javaLine`/`javaColumn` point at the method name; `javaEndColumn` is the
+exclusive UTF-16 column after that name. `javaEndLine` is the signature
+terminator. `xmlLine`/`xmlColumn`/`xmlEndColumn` bound the statement `id`
+value the same way. Hosts intercept go-to-definition only when the caret
+is inside those name ranges; return types and parameters keep LSP
+navigation. Java methods are collected from `tree-sitter-java` syntax
+nodes, so nested generics, split signatures, and commented-out methods
+are not mistaken for declarations. XML comments are ignored. Methods with
+a method body, including `default` methods, are omitted from the Java
+side of the index. Paths are indexed only when they are regular `.java`
+or mapper `.xml` files no larger than 2 MiB; `pom.xml` and other
+extensions are skipped before content is read.
+
+`diagnostics.redactText` accepts `text` and returns `redacted` with
+credentials, tokens, and home-directory paths replaced by stable placeholders
+(`<redacted>` for secrets, `<HOME>` for a macOS/Linux `Users`/`home` path or a
+Windows drive-letter `Users` path). Hosts run every diagnostic-bundle log
+line, panic report, and other free-form text through this command before it
+is staged for export; the command never reads the filesystem itself.
+Re-running it over already-redacted text is a no-op.
+
+`diagnostics.buildManifest` accepts an `environment` object
+(`appVersion`, `osName`, `osVersion`, `cpuCoreCount`, `memoryRssBytes`,
+`diskFreeBytes`), a `files` array of already-staged, already-redacted entries
+(`relativePath`, `sizeBytes`, `description`), and
+`generatedAtEpochMilliseconds`. It returns a `schemaVersion`ed manifest with
+`files` sorted by `relativePath` so the listing shown to the user before they
+confirm a diagnostic export — and the zip's contents — are deterministic
+across runs and across platforms. Hosts gather the environment and file facts
+natively; this command only shapes and sorts them.
+
+### Git patch discovery and rebase amendment preconditions
+
+`git.patchExport` accepts optional `metadataOnly` (default false). In metadata
+mode it returns candidate file counts and rename identities with empty `patch`
+and zero `byteLength`, independently of patch text encoding and exchange size.
+See [Patch exchange](git-patch-exchange.md) and its metadata fixture.
+
+`git.rebaseControl` requires `expectedHead` when `amendMessage` is present.
+Missing or stale HEAD rejects the amendment before writing; plain Continue,
+Skip and Abort do not require this field. Both products must send the HEAD
+reviewed by the amendment editor. See [Rebase sessions](git-rebase-session.md).

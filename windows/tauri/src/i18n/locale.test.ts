@@ -3,6 +3,16 @@ import { defaultSettings } from "@/features/settings/config/default-settings";
 import { createTranslator, getLocaleCatalog } from "./locale";
 
 describe("Windows display language", () => {
+  test("localizes Maven source-root categories", () => {
+    const english = createTranslator("en-US");
+    const chinese = createTranslator("zh-CN");
+
+    expect(english("maven.sourceRoot.mainJava")).toBe("main Java");
+    expect(chinese("maven.sourceRoot.mainJava")).toBe("主 Java 源码");
+    expect(english("maven.sourceRoot.generatedTest")).toBe("generated test");
+    expect(chinese("maven.sourceRoot.generatedTest")).toBe("生成的测试源码");
+  });
+
   test("uses Simplified Chinese strings and falls back to English", () => {
     const translate = createTranslator("zh-CN");
 
@@ -51,6 +61,7 @@ describe("Windows display language", () => {
     expect(translate("diagnostics.problemCount", { count: 0 })).toBe("0 个问题");
     expect(translate("files.open")).toBe("打开");
     expect(translate("files.copyContent")).toBe("复制内容");
+    expect(translate("terminal.copySelection")).toBe("复制所选内容");
     expect(translate("files.reveal")).toBe("在资源管理器中显示");
     expect(createTranslator("en-US")("files.reveal")).toBe("Reveal in File Explorer");
     expect(translate("quickOpen.searchFiles")).toBe("输入以搜索文件...");

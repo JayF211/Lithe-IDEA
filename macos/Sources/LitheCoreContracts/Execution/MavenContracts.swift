@@ -1,5 +1,38 @@
 import Foundation
 
+package enum MavenSourceRootKind: String, CaseIterable, Identifiable, Hashable, Sendable {
+    case mainJava
+    case mainResources
+    case testJava
+    case testResources
+    case generatedMain
+    case generatedTest
+
+    package var id: String { rawValue }
+    package var title: String {
+        switch self {
+        case .mainJava: "main Java"
+        case .mainResources: "main resources"
+        case .testJava: "test Java"
+        case .testResources: "test resources"
+        case .generatedMain: "generated main"
+        case .generatedTest: "generated test"
+        }
+    }
+}
+
+package struct MavenSourceRoot: Identifiable, Hashable, Sendable {
+    package let path: String
+    package let kind: MavenSourceRootKind
+
+    package init(path: String, kind: MavenSourceRootKind) {
+        self.path = path
+        self.kind = kind
+    }
+
+    package var id: String { "\(kind.rawValue):\(path)" }
+}
+
 package struct MavenProject: Identifiable, Hashable, Sendable {
     package let rootURL: URL
     package let pomURL: URL
@@ -7,6 +40,7 @@ package struct MavenProject: Identifiable, Hashable, Sendable {
     package let artifactID: String
     package let version: String?
     package let packaging: String
+    package let sourceRoots: [MavenSourceRoot]
     package let modules: [MavenModule]
     package let profiles: [MavenProfile]
     package let hasWrapper: Bool
@@ -20,7 +54,8 @@ package struct MavenProject: Identifiable, Hashable, Sendable {
         packaging: String,
         modules: [MavenModule],
         profiles: [MavenProfile],
-        hasWrapper: Bool
+        hasWrapper: Bool,
+        sourceRoots: [MavenSourceRoot] = []
     ) {
         self.rootURL = rootURL
         self.pomURL = pomURL
@@ -28,6 +63,7 @@ package struct MavenProject: Identifiable, Hashable, Sendable {
         self.artifactID = artifactID
         self.version = version
         self.packaging = packaging
+        self.sourceRoots = sourceRoots
         self.modules = modules
         self.profiles = profiles
         self.hasWrapper = hasWrapper
@@ -46,6 +82,7 @@ package struct MavenModule: Identifiable, Hashable, Sendable {
     package let artifactID: String
     package let version: String?
     package let packaging: String
+    package let sourceRoots: [MavenSourceRoot]
     package let modules: [MavenModule]
 
     package init(
@@ -55,7 +92,8 @@ package struct MavenModule: Identifiable, Hashable, Sendable {
         artifactID: String,
         version: String?,
         packaging: String,
-        modules: [MavenModule]
+        modules: [MavenModule],
+        sourceRoots: [MavenSourceRoot] = []
     ) {
         self.relativePath = relativePath
         self.url = url
@@ -63,6 +101,7 @@ package struct MavenModule: Identifiable, Hashable, Sendable {
         self.artifactID = artifactID
         self.version = version
         self.packaging = packaging
+        self.sourceRoots = sourceRoots
         self.modules = modules
     }
 
@@ -139,6 +178,62 @@ package struct MavenBuildIssue: Identifiable, Hashable, Sendable {
     }
 }
 
+package struct MavenTestFailureDetail: Identifiable, Hashable, Sendable {
+    package let id: String
+    package let name: String
+    package let kind: String
+    package let message: String?
+    package let fileURL: URL?
+    package let line: Int?
+    package let column: Int?
+
+    package init(
+        id: String,
+        name: String,
+        kind: String,
+        message: String?,
+        fileURL: URL?,
+        line: Int?,
+        column: Int?
+    ) {
+        self.id = id
+        self.name = name
+        self.kind = kind
+        self.message = message
+        self.fileURL = fileURL
+        self.line = line
+        self.column = column
+    }
+}
+
+package struct MavenTestResults: Equatable, Sendable {
+    package let testsRun: Int
+    package let failures: Int
+    package let errors: Int
+    package let skipped: Int
+    package let passed: Int
+    package let success: Bool
+    package let failureDetails: [MavenTestFailureDetail]
+
+    package init(
+        testsRun: Int,
+        failures: Int,
+        errors: Int,
+        skipped: Int,
+        passed: Int,
+        success: Bool,
+        failureDetails: [MavenTestFailureDetail]
+    ) {
+        self.testsRun = testsRun
+        self.failures = failures
+        self.errors = errors
+        self.skipped = skipped
+        self.passed = passed
+        self.success = success
+        self.failureDetails = failureDetails
+    }
+}
+
 package enum MavenProjectLoadState: Equatable, Sendable {
     case idle
     case loading
@@ -180,17 +275,20 @@ package struct MavenLocalConfiguration: Codable, Equatable, Sendable {
 
     package var version: Int
     package var settingsPath: String?
+    package var localRepositoryPath: String?
     package var mavenExecutablePath: String?
     package var javaHomePath: String?
 
     package init(
         version: Int = currentVersion,
         settingsPath: String? = nil,
+        localRepositoryPath: String? = nil,
         mavenExecutablePath: String? = nil,
         javaHomePath: String? = nil
     ) {
         self.version = version
         self.settingsPath = settingsPath
+        self.localRepositoryPath = localRepositoryPath
         self.mavenExecutablePath = mavenExecutablePath
         self.javaHomePath = javaHomePath
     }
@@ -216,6 +314,7 @@ package struct MavenLaunchContext: Codable, Equatable, Sendable {
     package let reactorPath: String
     package let profiles: [String]
     package let settingsPath: String?
+    package let localRepositoryPath: String?
     package let skipTests: Bool
     package let mavenExecutablePath: String?
     package let javaHomePath: String?
@@ -225,6 +324,7 @@ package struct MavenLaunchContext: Codable, Equatable, Sendable {
         reactorPath: String,
         profiles: [String],
         settingsPath: String?,
+        localRepositoryPath: String? = nil,
         skipTests: Bool,
         mavenExecutablePath: String?,
         javaHomePath: String?
@@ -233,6 +333,7 @@ package struct MavenLaunchContext: Codable, Equatable, Sendable {
         self.reactorPath = reactorPath
         self.profiles = profiles
         self.settingsPath = settingsPath
+        self.localRepositoryPath = localRepositoryPath
         self.skipTests = skipTests
         self.mavenExecutablePath = mavenExecutablePath
         self.javaHomePath = javaHomePath
@@ -261,6 +362,67 @@ package struct MavenLaunchPlan: Equatable, Sendable {
     }
 }
 
+package enum MavenDependencyResolution: String, Equatable, Sendable {
+    case resolved
+    case omittedDuplicate
+    case omittedConflict
+}
+
+package struct MavenDependency: Equatable, Sendable {
+    package let modulePath: String
+    package let groupID: String
+    package let artifactID: String
+    package let version: String
+    package let type: String
+    package let classifier: String?
+    package let scope: String
+    package let resolution: MavenDependencyResolution
+    package let selectedVersion: String?
+    package let children: [MavenDependency]
+
+    package init(
+        modulePath: String,
+        groupID: String,
+        artifactID: String,
+        version: String,
+        type: String,
+        classifier: String?,
+        scope: String,
+        resolution: MavenDependencyResolution,
+        selectedVersion: String?,
+        children: [MavenDependency]
+    ) {
+        self.modulePath = modulePath
+        self.groupID = groupID
+        self.artifactID = artifactID
+        self.version = version
+        self.type = type
+        self.classifier = classifier
+        self.scope = scope
+        self.resolution = resolution
+        self.selectedVersion = selectedVersion
+        self.children = children
+    }
+}
+
+package struct MavenDependencyTree: Equatable, Sendable {
+    package let modulePath: String
+    package let dependencies: [MavenDependency]
+
+    package init(modulePath: String, dependencies: [MavenDependency]) {
+        self.modulePath = modulePath
+        self.dependencies = dependencies
+    }
+}
+
+package enum MavenDependencyLoadState: Equatable, Sendable {
+    case idle
+    case loading
+    case ready([MavenDependency])
+    case failed(String)
+    case cancelled
+}
+
 package func redactedMavenArgumentsForDisplay(_ arguments: [String]) -> [String] {
     var result: [String] = []
     var index = 0
@@ -276,6 +438,9 @@ package func redactedMavenArgumentsForDisplay(_ arguments: [String]) -> [String]
             }
         } else if argument.hasPrefix("--settings=") || argument.hasPrefix("-s=") {
             result.append(String(argument.prefix { $0 != "=" }) + "=<settings.xml>")
+            index += 1
+        } else if argument.hasPrefix("-Dmaven.repo.local=") {
+            result.append("-Dmaven.repo.local=<localRepository>")
             index += 1
         } else {
             result.append(argument)
@@ -310,7 +475,39 @@ package protocol MavenProjectOperations: Sendable {
         module: String?,
         goals: [String]
     ) throws -> MavenLaunchPlan
+    func mavenDependencyPlan(
+        at rootURL: URL,
+        context: MavenLaunchContext,
+        module: String?
+    ) throws -> MavenLaunchPlan
+    func mavenDependencies(modulePath: String, output: String) throws -> MavenDependencyTree
     func mavenDiagnostics(output: String, projectRoot: URL) -> [MavenBuildIssue]
+    func mavenTestResults(output: String, projectRoot: URL) -> MavenTestResults?
+}
+
+extension MavenProjectOperations {
+    package func mavenDependencyPlan(
+        at _: URL,
+        context _: MavenLaunchContext,
+        module _: String?
+    ) throws -> MavenLaunchPlan {
+        throw MavenOperationError(
+            code: "not_supported",
+            message: "Maven dependency planning is unavailable."
+        )
+    }
+
+    package func mavenDependencies(
+        modulePath _: String,
+        output _: String
+    ) throws -> MavenDependencyTree {
+        throw MavenOperationError(
+            code: "not_supported",
+            message: "Maven dependency parsing is unavailable."
+        )
+    }
+
+    package func mavenTestResults(output _: String, projectRoot _: URL) -> MavenTestResults? { nil }
 }
 
 package protocol MavenConfigurationStoring: Sendable {

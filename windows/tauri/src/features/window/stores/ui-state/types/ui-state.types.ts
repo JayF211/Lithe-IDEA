@@ -19,6 +19,7 @@ export type BottomPaneTab =
   | "references"
   | "buffers"
   | "run"
+  // Maven task output is independent from the right-side Maven navigation tool window.
   | "maven"
   | "gitLog";
 

@@ -1,4 +1,5 @@
 import Foundation
+import LitheCoreContracts
 import LitheGitModule
 import LitheLocalHistoryModule
 import LitheSearchModule
@@ -10,6 +11,9 @@ extension AppModel {
     var isIndexingSpring: Bool { springFeature.isIndexing }
     var rootNode: FileNode? { workspaceFeature.rootNode }
     var projectFiles: [URL] { workspaceFeature.projectFiles }
+    var projectDirectoryMarks: [String: WorkspaceDirectoryMark] {
+        workspaceFeature.directoryMarks
+    }
     var javaEnvironmentReport: JavaEnvironmentReport? {
         runtimeFeature.javaEnvironmentReport
     }
@@ -29,6 +33,8 @@ extension AppModel {
     }
 
     var openDocuments: [EditorDocument] { documentFeature.openDocuments }
+    var openMediaDocuments: [MediaDocument] { mediaFeature.openMediaDocuments }
+    var activeMediaDocument: MediaDocument? { mediaFeature.activeMediaDocument }
     var standaloneFileLoadState: StandaloneFileLoadState {
         documentFeature.standaloneFileLoadState
     }
@@ -61,6 +67,8 @@ extension AppModel {
     func consumeProjectTreeRevealRequest(id: UUID) {
         documentFeature.consumeProjectTreeRevealRequest(id: id)
     }
+
+    var activeMediaDocumentID: UUID? { mediaFeature.activeMediaDocumentID }
 
     var activeDocumentID: UUID? {
         get { documentFeature.activeDocumentID }
@@ -122,6 +130,12 @@ extension AppModel {
                 orderedIDs: editorTabOrderFeature.terminalIDs
             )
             selectEditorTerminalSession(session)
+        case .media(let mediaID):
+            guard let media = openMediaDocuments.first(where: { $0.id == mediaID }) else {
+                editorTabOrderFeature.remove(item)
+                return
+            }
+            selectMediaDocument(media)
         }
     }
     var pendingCloseDocument: EditorDocument? { documentFeature.pendingCloseDocument }
@@ -132,16 +146,12 @@ extension AppModel {
         gitFeatureIfActive?.gitTreeStatus ?? GitTreeStatusProjection(changes: [])
     }
     func gitChange(for url: URL) -> GitChange? {
-        guard let root = gitRepositoryRoot,
-              let relativePath = workspaceRelativePath(for: url, root: root) else { return nil }
-        return gitFeatureIfActive?.gitTreeStatus.change(relativePath: relativePath)
+        return gitFeatureIfActive?.gitTreeStatus.change(relativePath: url.standardizedFileURL.path)
     }
 
     func gitTreeStatus(for url: URL, isDirectory: Bool) -> GitChangeKind? {
-        guard let root = gitRepositoryRoot,
-              let relativePath = workspaceRelativePath(for: url, root: root) else { return nil }
         return gitFeatureIfActive?.gitTreeStatus.kind(
-            relativePath: relativePath,
+            relativePath: url.standardizedFileURL.path,
             isDirectory: isDirectory
         )
     }
@@ -159,19 +169,11 @@ extension AppModel {
     var gitOperationState: GitOperationState? { gitFeatureIfActive?.gitOperationState }
     var gitConsoleEntries: [GitConsoleEntry] { gitFeatureIfActive?.gitConsoleEntries ?? [] }
     var isResolvingGitOperation: Bool { gitFeatureIfActive?.isResolvingGitOperation ?? false }
-    func clearGitConsole() { gitFeatureIfActive?.clearGitConsole() }
-    func loadGitConsoleIfNeeded() async { await gitFeatureIfActive?.loadGitConsoleIfNeeded() }
     var gitRepositoryRoot: URL? { gitFeatureIfActive?.gitRepositoryRoot }
     var currentBranch: String { gitFeatureIfActive?.currentBranch ?? "No Git" }
     var selectedChange: GitChange? {
         get { gitFeatureIfActive?.selectedChange }
         set { gitFeatureIfActive?.selectedChange = newValue }
-    }
-    var diffRows: [DiffRow] { gitFeatureIfActive?.diffRows ?? [] }
-    var diffHunks: [DiffHunk] { gitFeatureIfActive?.diffHunks ?? [] }
-    var gitDiffWhitespaceMode: GitDiffWhitespaceMode {
-        get { gitFeatureIfActive?.gitDiffWhitespaceMode ?? .doNotIgnore }
-        set { gitFeatureIfActive?.gitDiffWhitespaceMode = newValue }
     }
     var isLoadingDiff: Bool { gitFeatureIfActive?.isLoadingDiff ?? false }
     var isRefreshingGit: Bool { gitFeatureIfActive?.isRefreshingGit ?? false }
@@ -213,18 +215,23 @@ extension AppModel {
     var requestedStashReference: String? {
         gitFeatureIfActive?.requestedStashReference
     }
+    var recentlyDeletedTag: GitTagDeletion? {
+        gitFeatureIfActive?.recentlyDeletedTag
+    }
+    var recentlyDeletedBranch: GitBranchDeletion? {
+        gitFeatureIfActive?.recentlyDeletedBranch
+    }
     var isCommitting: Bool { gitFeatureIfActive?.isCommitting ?? false }
     var gitBlameLines: [URL: [GitBlameLine]] { gitFeatureIfActive?.gitBlameLines ?? [:] }
     var gitReferences: [GitReference] { gitFeatureIfActive?.gitReferences ?? [] }
-    var recentGitReferences: [GitReference] { gitFeatureIfActive?.recentGitReferences ?? [] }
     var gitCommits: [GitCommit] { gitFeatureIfActive?.gitCommits ?? [] }
-    var gitLogMatchedCommitHashes: Set<String>? {
-        gitFeatureIfActive?.gitLogMatchedCommitHashes
-    }
     var isFilteringGitLog: Bool { gitFeatureIfActive?.isFilteringGitLog ?? false }
     var selectedGitReference: GitReference? {
         get { gitFeatureIfActive?.selectedGitReference }
         set { gitFeatureIfActive?.selectedGitReference = newValue }
+    }
+    var isShowingAllGitReferences: Bool {
+        gitFeatureIfActive?.isShowingAllGitReferences ?? false
     }
     var selectedGitCommit: GitCommit? {
         get { gitFeatureIfActive?.selectedGitCommit }
@@ -242,16 +249,9 @@ extension AppModel {
         get { gitFeatureIfActive?.selectedGitCommitDiffContext }
         set { gitFeatureIfActive?.selectedGitCommitDiffContext = newValue }
     }
-    var isLoadingGitHistory: Bool { gitFeatureIfActive?.isLoadingGitHistory ?? false }
     var isLoadingMoreGitHistory: Bool { gitFeatureIfActive?.isLoadingMoreGitHistory ?? false }
     var canLoadMoreGitHistory: Bool { gitFeatureIfActive?.canLoadMoreGitHistory ?? false }
     var branchComparison: GitBranchComparison? { gitFeatureIfActive?.branchComparison }
-    var selectedBranchComparisonFile: GitBranchComparisonFile? {
-        get { gitFeatureIfActive?.selectedBranchComparisonFile }
-        set { gitFeatureIfActive?.selectedBranchComparisonFile = newValue }
-    }
-    var branchComparisonRows: [DiffRow] { gitFeatureIfActive?.branchComparisonRows ?? [] }
-    var isLoadingBranchComparison: Bool { gitFeatureIfActive?.isLoadingBranchComparison ?? false }
     var isPerformingBranchOperation: Bool { gitFeatureIfActive?.isPerformingBranchOperation ?? false }
     var isCloningRepository: Bool { gitFeatureIfActive?.isCloningRepository ?? false }
     var languageNavigationResults: [LanguageNavigationLocation] {
@@ -266,20 +266,8 @@ extension AppModel {
     var isLoadingWorkspace: Bool { workspaceFeature.isLoadingWorkspace }
     var isRefreshingWorkspace: Bool { workspaceFeature.isRefreshingWorkspace }
     var workspaceLoadErrorMessage: String? { workspaceFeature.loadErrorMessage }
-    var searchResults: [FileSearchResult] { searchFeatureIfActive?.searchResults ?? [] }
-    var isSearching: Bool { searchFeatureIfActive?.isSearching ?? false }
-    var searchEverywhereResults: SearchEverywhereResults {
-        searchFeatureIfActive?.searchEverywhereResults ?? SearchEverywhereResults()
-    }
-    var searchEverywhereActionMatches: [LitheAction] {
-        LitheActionRegistry.actions(for: self).filter { $0.matches(searchEverywhereQuery) }
-    }
-    var isSearchingEverywhere: Bool { searchFeatureIfActive?.isSearchingEverywhere ?? false }
-    var projectReplacementFiles: [ProjectReplacementFile] {
-        searchFeatureIfActive?.projectReplacementFiles ?? []
-    }
-    var isLoadingProjectReplacement: Bool {
-        searchFeatureIfActive?.isLoadingProjectReplacement ?? false
+    func searchEverywhereActionMatches(query: String) -> [LitheAction] {
+        LitheActionRegistry.actions(for: self).filter { $0.matches(query) }
     }
 
     var localHistoryRequest: LocalHistoryRequest? {
@@ -344,7 +332,7 @@ extension AppModel {
         case "navigate-forward":
             canNavigateForward
         case "go-to-definition":
-            activeDocument.map { springFeature.handles($0.url) } == true
+            activeDocument.map { springFeature.handles($0.url) || mybatisFeature.handles($0.url) } == true
                 || supportsLanguageServerFeature(.definition)
         case "find-usages":
             supportsLanguageServerFeature(.references)
@@ -361,5 +349,59 @@ extension AppModel {
         default:
             false
         }
+    }
+
+    func prepareProjectRuntimeSettings() async {
+        await runtimeFeature.refreshAvailableRuntimes()
+        if workspaceURL != nil {
+            _ = await activateExecutionModule()
+        }
+        runtimeFeature.prepare(
+            workspaceName: projectName,
+            workspaceURL: workspaceURL,
+            files: projectFiles,
+            mavenProject: mavenFeatureIfActive?.project,
+            toolchain: runFeatureIfActive?.projectToolchain,
+            mavenSettingsPath: mavenFeatureIfActive?.settingsPath,
+            mavenLocalRepositoryPath: mavenFeatureIfActive?.localRepositoryPath,
+            mavenExecutablePath: mavenFeatureIfActive?.mavenExecutablePath,
+            mavenJavaHomePath: mavenFeatureIfActive?.javaHomePath
+        )
+    }
+
+    func persistProjectRuntimeSettings() {
+        let settings = runtimeFeature.settings
+        if let maven = mavenFeatureIfActive {
+            let mavenJDK = settings.mavenJavaHomePath.isEmpty
+                ? settings.javaHomePath
+                : settings.mavenJavaHomePath
+            maven.updateLocalConfiguration(
+                settingsPath: settings.mavenSettingsPath,
+                localRepositoryPath: settings.mavenLocalRepositoryPath,
+                mavenExecutablePath: settings.mavenExecutableOverride,
+                javaHomePath: mavenJDK
+            )
+        }
+        guard let run = runFeatureIfActive,
+              run.configurationStatus == .ready else { return }
+        let configuration = run.selectedConfiguration
+            ?? run.configurations.first { $0.kind.capabilities.contains(.javaRuntime) }
+            ?? run.configurations.first
+        guard let configuration else { return }
+        var options = run.options(for: configuration)
+        let previousToolchain = run.projectToolchain
+        if options.javaHomePath == previousToolchain.javaHomePath { options.javaHomePath = "" }
+        if options.mavenExecutablePath == previousToolchain.mavenExecutablePath {
+            options.mavenExecutablePath = ""
+        }
+        if options.mavenJavaHomePath == previousToolchain.mavenJavaHomePath {
+            options.mavenJavaHomePath = ""
+        }
+        _ = run.saveEditorChanges(
+            options,
+            toolchain: runtimeFeature.projectToolchainSelection,
+            for: configuration,
+            scope: .local
+        )
     }
 }

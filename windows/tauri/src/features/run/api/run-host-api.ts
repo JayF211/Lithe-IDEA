@@ -1,4 +1,5 @@
 import { invoke } from "@/platform/tauri-core";
+import { getRunWindowLabel } from "../utils/run-window-context";
 import type {
   GenericRuntime,
   GlobalToolchain,
@@ -27,7 +28,11 @@ export function writeRunDocuments(
 }
 
 export function writeRunStdin(sessionId: string, input: string) {
-  return invoke<void>("run_write_stdin", { sessionId, input });
+  return invoke<void>("run_write_stdin", {
+    windowLabel: getRunWindowLabel(),
+    sessionId,
+    input,
+  });
 }
 
 export function discoverRunToolchains(root: string, selected?: GlobalToolchain) {
@@ -58,14 +63,24 @@ export function resolveRunLaunch(args: {
 
 export function startRunProcess(args: {
   sessionId: string;
+  executionId?: string;
   executable: string;
   arguments: string[];
   workingDirectory: string;
   environment: Record<string, string>;
 }) {
-  return invoke<void>("run_start_process", { args });
+  return invoke<void>("run_start_process", {
+    args: {
+      ...args,
+      windowLabel: getRunWindowLabel(),
+    },
+  });
 }
 
-export function stopRunProcess(sessionId: string) {
-  return invoke<void>("run_stop_process", { sessionId });
+export function stopRunProcess(sessionId: string, executionId?: string) {
+  return invoke<void>("run_stop_process", {
+    windowLabel: getRunWindowLabel(),
+    sessionId,
+    ...(executionId ? { executionId } : {}),
+  });
 }

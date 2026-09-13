@@ -19,6 +19,7 @@ import {
   type Icon,
 } from "@/ui/icons";
 import { MacSettingsPanel, type MacSettingsCategory } from "./macos-settings-panels";
+import { showConfirmDialog } from "@/ui/dialog";
 
 interface SettingsDialogProps {
   isOpen: boolean;
@@ -39,12 +40,15 @@ const categories: CategoryItem[] = [
   { id: "lsp", labelKey: "settings.tabs.lsp", icon: DatabaseIcon },
   { id: "maven", labelKey: "settings.tabs.maven", icon: PackageIcon },
   { id: "ai", labelKey: "settings.tabs.aiCommit", icon: MagicWandIcon },
+  { id: "git", labelKey: "settings.tabs.git", icon: CodeBlockIcon },
   { id: "logs", labelKey: "settings.tabs.logs", icon: FileTextIcon },
   { id: "updates", labelKey: "settings.tabs.updates", icon: ArrowClockwiseIcon },
 ];
 
 function categoryFromRequestedTab(tab: SettingsTab | null): MacSettingsCategory {
   switch (tab) {
+    case "git":
+      return "git";
     case "editor":
     case "keyboard":
     case "terminal":
@@ -85,7 +89,15 @@ const SettingsDialog = ({ isOpen, onClose }: SettingsDialogProps) => {
             type="button"
             variant="ghost"
             className="text-subtle-foreground"
-            onClick={() => void resetToDefaults()}
+            onClick={async () => {
+              const confirmed = await showConfirmDialog(
+                t("settings.mac.restoreDefaultsConfirm"),
+                { title: t("settings.mac.restoreDefaults") }
+              );
+              if (confirmed) {
+                void resetToDefaults();
+              }
+            }}
           >
             {t("settings.mac.restoreDefaults")}
           </Button>

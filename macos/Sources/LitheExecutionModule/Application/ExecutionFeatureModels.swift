@@ -30,10 +30,23 @@ package final class MavenFeatureModel: ObservableObject {
     package var selectedProfiles: Set<String> { service.selectedProfiles }
     package var skipTests: Bool { service.skipTests }
     package var settingsPath: String? { service.settingsPath }
+    package var localRepositoryPath: String? { service.localRepositoryPath }
     package var mavenExecutablePath: String? { service.mavenExecutablePath }
     package var javaHomePath: String? { service.javaHomePath }
     package var configurationSaveError: String? { service.configurationSaveError }
     package var isReloadRequired: Bool { service.isReloadRequired }
+    package var isProjectReloadRequired: Bool { service.isProjectReloadRequired }
+    package var isReloading: Bool { service.isReloading }
+    package var reloadError: String? { service.reloadError }
+    package func markPomChanged(_ url: URL) { service.markPomChanged(url) }
+    package func reloadProject(
+        files: [URL], rescan: Bool,
+        synchronizeJava: @escaping @MainActor () async throws -> Void
+    ) async {
+        await service.reloadProject(files: files, rescan: rescan, synchronizeJava: synchronizeJava)
+    }
+    package var dependencyStates: [String: MavenDependencyLoadState] { service.dependencyStates }
+    package var isResolvingDependencies: Bool { service.isResolvingDependencies }
     package var launchContext: MavenLaunchContext? { service.launchContext }
 
     package func loadProject(at workspaceURL: URL, files: [URL], snapshotID: UUID? = nil) async {
@@ -67,11 +80,13 @@ package final class MavenFeatureModel: ObservableObject {
 
     package func updateLocalConfiguration(
         settingsPath: String?,
+        localRepositoryPath: String?,
         mavenExecutablePath: String?,
         javaHomePath: String?
     ) {
         service.updateLocalConfiguration(
             settingsPath: settingsPath,
+            localRepositoryPath: localRepositoryPath,
             mavenExecutablePath: mavenExecutablePath,
             javaHomePath: javaHomePath
         )
@@ -79,6 +94,18 @@ package final class MavenFeatureModel: ObservableObject {
 
     package func acknowledgeReload() {
         service.acknowledgeReload()
+    }
+
+    package func dependencyState(for modulePath: String) -> MavenDependencyLoadState {
+        service.dependencyState(for: modulePath)
+    }
+
+    package func loadDependencies(for modulePath: String) {
+        service.loadDependencies(for: modulePath)
+    }
+
+    package func cancelDependencies(for modulePath: String) {
+        service.cancelDependencies(for: modulePath)
     }
 
     package func reset() { service.reset() }
@@ -123,6 +150,19 @@ package final class RunFeatureModel: ObservableObject {
     package var selectedConfiguration: RunConfiguration? { service.selectedConfiguration }
     package var lastRunFileURL: URL? { service.lastRunFileURL }
     package var lastConfiguration: RunConfiguration? { service.lastConfiguration }
+    /// Project configurations share session identity across toolbar and log selection.
+    /// Current File alone uses the primary output stream.
+    package var selectedProjectSessionID: String? {
+        guard let configuration = selectedConfiguration, configuration.kind != .currentFile else { return nil }
+        return configuration.id
+    }
+    package var isSelectedConfigurationRunning: Bool {
+        guard let configuration = selectedConfiguration else { return false }
+        if configuration.kind != .currentFile {
+            return moduleSessions.contains { $0.configurationID == configuration.id && $0.isRunning }
+        }
+        return isRunning && lastConfiguration?.id == configuration.id
+    }
     package var isLoadingProject: Bool { service.isLoadingProject }
     package var isRunning: Bool { service.isRunning }
     package var runningTitle: String? { service.runningTitle }
@@ -280,7 +320,7 @@ package final class ProjectDevelopmentFeatureModel {
         }
         if hasMavenDescriptor {
             await mavenFeature.loadProject(at: workspaceURL, files: files)
-        } else {
+        } else if !mavenFeature.isProjectReloadRequired && !mavenFeature.isReloading {
             mavenFeature.reset()
         }
         await runFeature.loadProject(

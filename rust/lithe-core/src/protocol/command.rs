@@ -47,6 +47,8 @@ pub enum CoreCommand {
     CommunityDiscourseAuthRevoke,
     /// Builds the visible project tree (`workspace.snapshot`).
     WorkspaceSnapshot,
+    /// Finds Git repositories that belong to an opened workspace (`workspace.repositories`).
+    WorkspaceRepositories,
     /// Builds or reuses the workspace search index (`workspace.searchIndex.warm`).
     WorkspaceSearchIndexWarm,
     /// Applies changed paths to the search index (`workspace.searchIndex.update`).
@@ -81,8 +83,14 @@ pub enum CoreCommand {
     MavenScan,
     /// Produces a deterministic Maven invocation (`maven.launchPlan`).
     MavenLaunchPlan,
+    /// Produces a bounded Maven dependency-tree invocation (`maven.dependencyPlan`).
+    MavenDependencyPlan,
+    /// Normalizes Maven dependency-tree output (`maven.dependencies`).
+    MavenDependencies,
     /// Normalizes diagnostics from Maven output (`maven.diagnostics`).
     MavenDiagnostics,
+    /// Normalizes JUnit/Surefire results from Maven output (`maven.testResults`).
+    MavenTestResults,
     /// Renders and sanitizes shared Markdown (`markdown.render`).
     MarkdownRender,
     /// Creates one transport-neutral Debug Adapter Protocol session (`debug.createSession`).
@@ -143,6 +151,8 @@ pub enum CoreCommand {
     JavaJdtWorkspaceFingerprint,
     /// Gracefully shuts down a managed server (`lsp.stopServer`).
     LspStopServer,
+    /// Retries Maven profile application for an existing Java session.
+    LspRetryMavenProfiles,
     /// Opens or updates a synchronized document (`lsp.syncDocument`).
     LspSyncDocument,
     /// Publishes external workspace file changes (`lsp.workspaceFilesChanged`).
@@ -185,28 +195,62 @@ pub enum CoreCommand {
     JavaClassName,
     /// Finds a Java type or member declaration (`java.sourceDefinition`).
     JavaSourceDefinition,
+    /// Discovers JUnit test methods and source ranges (`java.testMethods`).
+    JavaTestMethods,
     /// Reads a Spring server port from configuration (`java.serverPort`).
     JavaServerPort,
     /// Computes lightweight Java structure features (`java.structure`).
     JavaStructure,
     /// Builds Spring configuration, bean, injection, and endpoint indexes (`spring.index`).
     SpringIndex,
+    /// Builds MyBatis mapper-interface and XML statement indexes (`mybatis.index`).
+    MybatisIndex,
     /// Reads normalized repository and working-tree state (`git.status`).
     GitStatus,
     /// Resolves paths a Git-aware watcher must observe (`git.watchContext`).
     GitWatchContext,
+    /// Lists worktrees registered for the repository (`git.worktrees`).
+    GitWorktrees,
     /// Describes the checked-out branch or detached worktree for PR creation (`git.pullRequestContext`).
     GitPullRequestContext,
     /// Executes a caller-supplied argument vector without a shell (`git.command`).
     GitCommand,
     /// Performs one supported Git mutation (`git.write`).
     GitWrite,
+    /// Inspects repository initialization and scoped commit identity.
+    GitRepositorySetup,
+    /// Initializes an existing folder outside any repository.
+    GitInitialize,
+    /// Writes or clears one explicitly scoped commit identity field.
+    GitConfigureIdentity,
+    /// Reviews a local history mutation and its immutable checkout snapshot (`git.historyRewritePreview`).
+    GitHistoryRewritePreview,
+    /// Preview a linear local range after an unchanged base commit.
+    GitRebasePreview,
+    /// Start a reviewed native interactive rebase with a durable session.
+    GitRebaseStart,
+    /// Read the current checkout's last owned interactive rebase session.
+    GitRebaseSession,
+    /// Continue, skip, or abort an identified native rebase session.
+    GitRebaseControl,
+    /// Exports a lossless UTF-8 exchange patch (`git.patchExport`).
+    GitPatchExport,
+    /// Reviews a patch with a forward applicability check (`git.patchPreview`).
+    GitPatchPreview,
+    /// Applies a patch tied to its reviewed snapshot (`git.patchApply`).
+    GitPatchApply,
     /// Builds a structured Git diff (`git.diff`).
     GitDiff,
     /// Applies a patch to the index or working tree (`git.apply`).
     GitApply,
     /// Lists references and bounded commit history (`git.history`).
     GitHistory,
+    /// Lists Git references without repeating commit history (`git.references`).
+    GitReferences,
+    /// Returns one cursor-based commit page (`git.historyPage`).
+    GitHistoryPage,
+    /// Releases an incremental history cursor (`git.historyCursorClose`).
+    GitHistoryCursorClose,
     /// Resolves the destination and commits for a branch push (`git.pushPreview`).
     GitPushPreview,
     /// Resolves metadata for one commit (`git.commit`).
@@ -235,6 +279,10 @@ pub enum CoreCommand {
     GitHubRequestPlan,
     /// Normalizes a GitHub HTTP response into the shared contract (`github.normalizeResponse`).
     GitHubNormalizeResponse,
+    /// Redacts credentials, tokens, and home-directory paths from diagnostic text (`diagnostics.redactText`).
+    DiagnosticsRedactText,
+    /// Shapes a deterministic diagnostic bundle manifest from host-gathered facts (`diagnostics.buildManifest`).
+    DiagnosticsBuildManifest,
 }
 
 impl CoreCommand {
@@ -251,6 +299,7 @@ impl CoreCommand {
             "community.discourse.search" => Some(Self::CommunityDiscourseSearch),
             "community.discourse.auth.revoke" => Some(Self::CommunityDiscourseAuthRevoke),
             "workspace.snapshot" => Some(Self::WorkspaceSnapshot),
+            "workspace.repositories" => Some(Self::WorkspaceRepositories),
             "workspace.searchIndex.warm" => Some(Self::WorkspaceSearchIndexWarm),
             "workspace.searchIndex.update" => Some(Self::WorkspaceSearchIndexUpdate),
             "workspace.searchIndex.invalidate" => Some(Self::WorkspaceSearchIndexInvalidate),
@@ -268,7 +317,10 @@ impl CoreCommand {
             "history.delete" => Some(Self::HistoryDelete),
             "maven.scan" => Some(Self::MavenScan),
             "maven.launchPlan" => Some(Self::MavenLaunchPlan),
+            "maven.dependencyPlan" => Some(Self::MavenDependencyPlan),
+            "maven.dependencies" => Some(Self::MavenDependencies),
             "maven.diagnostics" => Some(Self::MavenDiagnostics),
+            "maven.testResults" => Some(Self::MavenTestResults),
             "markdown.render" => Some(Self::MarkdownRender),
             "debug.createSession" => Some(Self::DebugCreateSession),
             "debug.launch" => Some(Self::DebugLaunch),
@@ -299,6 +351,7 @@ impl CoreCommand {
             "java.jdtCacheRetention" => Some(Self::JavaJdtCacheRetention),
             "java.jdtWorkspaceFingerprint" => Some(Self::JavaJdtWorkspaceFingerprint),
             "lsp.stopServer" => Some(Self::LspStopServer),
+            "lsp.retryMavenProfiles" => Some(Self::LspRetryMavenProfiles),
             "lsp.syncDocument" => Some(Self::LspSyncDocument),
             "lsp.workspaceFilesChanged" => Some(Self::LspWorkspaceFilesChanged),
             "lsp.closeDocument" => Some(Self::LspCloseDocument),
@@ -319,18 +372,35 @@ impl CoreCommand {
             "java.codeVision" => Some(Self::JavaCodeVision),
             "java.className" => Some(Self::JavaClassName),
             "java.sourceDefinition" => Some(Self::JavaSourceDefinition),
+            "java.testMethods" => Some(Self::JavaTestMethods),
             "java.serverPort" => Some(Self::JavaServerPort),
             "java.structure" => Some(Self::JavaStructure),
             "java.navigationMarkers" => Some(Self::JavaNavigationMarkers),
             "spring.index" => Some(Self::SpringIndex),
+            "mybatis.index" => Some(Self::MybatisIndex),
             "git.status" => Some(Self::GitStatus),
             "git.watchContext" => Some(Self::GitWatchContext),
+            "git.worktrees" => Some(Self::GitWorktrees),
             "git.pullRequestContext" => Some(Self::GitPullRequestContext),
             "git.command" => Some(Self::GitCommand),
             "git.write" => Some(Self::GitWrite),
+            "git.historyRewritePreview" => Some(Self::GitHistoryRewritePreview),
+            "git.rebasePreview" => Some(Self::GitRebasePreview),
+            "git.repositorySetup" => Some(Self::GitRepositorySetup),
+            "git.initialize" => Some(Self::GitInitialize),
+            "git.configureIdentity" => Some(Self::GitConfigureIdentity),
+            "git.rebaseStart" => Some(Self::GitRebaseStart),
+            "git.rebaseSession" => Some(Self::GitRebaseSession),
+            "git.rebaseControl" => Some(Self::GitRebaseControl),
+            "git.patchExport" => Some(Self::GitPatchExport),
+            "git.patchPreview" => Some(Self::GitPatchPreview),
+            "git.patchApply" => Some(Self::GitPatchApply),
             "git.diff" => Some(Self::GitDiff),
             "git.apply" => Some(Self::GitApply),
             "git.history" => Some(Self::GitHistory),
+            "git.references" => Some(Self::GitReferences),
+            "git.historyPage" => Some(Self::GitHistoryPage),
+            "git.historyCursorClose" => Some(Self::GitHistoryCursorClose),
             "git.pushPreview" => Some(Self::GitPushPreview),
             "git.commit" => Some(Self::GitCommit),
             "git.commitFiles" => Some(Self::GitCommitFiles),
@@ -345,6 +415,8 @@ impl CoreCommand {
             "github.parseRemote" => Some(Self::GitHubParseRemote),
             "github.requestPlan" => Some(Self::GitHubRequestPlan),
             "github.normalizeResponse" => Some(Self::GitHubNormalizeResponse),
+            "diagnostics.redactText" => Some(Self::DiagnosticsRedactText),
+            "diagnostics.buildManifest" => Some(Self::DiagnosticsBuildManifest),
             _ => None,
         }
     }
@@ -393,6 +465,22 @@ mod tests {
     }
 
     #[test]
+    fn parses_maven_test_results_command() {
+        assert!(matches!(
+            CoreCommand::parse("maven.testResults"),
+            Some(CoreCommand::MavenTestResults)
+        ));
+    }
+
+    #[test]
+    fn parses_java_test_methods_command() {
+        assert!(matches!(
+            CoreCommand::parse("java.testMethods"),
+            Some(CoreCommand::JavaTestMethods)
+        ));
+    }
+
+    #[test]
     fn parses_debug_runtime_commands() {
         for command in [
             "debug.createSession",
@@ -423,6 +511,14 @@ mod tests {
         assert!(matches!(
             CoreCommand::parse("git.pushPreview"),
             Some(CoreCommand::GitPushPreview)
+        ));
+    }
+
+    #[test]
+    fn parses_workspace_repositories_command() {
+        assert!(matches!(
+            CoreCommand::parse("workspace.repositories"),
+            Some(CoreCommand::WorkspaceRepositories)
         ));
     }
 }

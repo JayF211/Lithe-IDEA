@@ -1,6 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod core;
+mod debug;
+mod diagnostics;
 mod file_events;
 mod host;
 mod logging;
@@ -15,6 +17,7 @@ mod watcher;
 
 use file_events::TauriFileChangeEmitter;
 use lithe_project::FileWatcher;
+use lithe_project::git_watcher::GitMetadataWatcher;
 use lithe_terminal::TerminalManager;
 use std::sync::Arc;
 use tauri::Manager;
@@ -56,6 +59,9 @@ fn main() {
             app.manage(Arc::new(FileWatcher::new(Arc::new(
                 TauriFileChangeEmitter::new(app.handle().clone()),
             ))));
+            app.manage(Arc::new(GitMetadataWatcher::new(Arc::new(
+                TauriFileChangeEmitter::new(app.handle().clone()),
+            ))));
             app.manage(Arc::new(TerminalManager::new()));
             app.manage(terminal::FrontendTerminalSessions::default());
             app.manage(host::PendingCliOpenRequests::from_arguments(
@@ -63,15 +69,35 @@ fn main() {
             ));
             app.manage(host::FileClipboard::default());
             app.manage(run::RunProcessManager::default());
+            app.manage(debug::DebugAdapterManager::default());
             run::cleanup_legacy_appdata(app.handle());
             if let Some(window) = app.get_webview_window("main") {
                 host::apply_window_taskbar_icon(&window);
             }
             Ok(())
         })
+        .on_window_event(|window, event| {
+            if matches!(event, tauri::WindowEvent::Destroyed) {
+                if let Some(watcher) = window.try_state::<Arc<GitMetadataWatcher>>() {
+                    if let Err(error) = watcher.remove(window.label(), None) {
+                        eprintln!("Could not release Git metadata watches: {error}");
+                    }
+                }
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             core::core_execute,
             core::core_cancel,
+            diagnostics::preview_diagnostic_bundle,
+            diagnostics::export_diagnostic_bundle,
+            debug::debug_start_session,
+            debug::debug_connect_session,
+            debug::debug_allocate_loopback_port,
+            debug::debug_wait_for_port,
+            debug::debug_session_ready,
+            debug::debug_send_request,
+            debug::debug_stop_session,
+            debug::debug_stop_workspace_sessions,
             platform::platform_invoke,
             memory::get_application_memory_usage,
             terminal::begin_frontend_terminal_session,
@@ -85,6 +111,8 @@ fn main() {
             watcher::start_watching,
             watcher::stop_watching,
             watcher::set_project_root,
+            watcher::watch_git_repository,
+            watcher::unwatch_git_repository,
             secure_storage::store_secure_secret,
             secure_storage::get_secure_secret,
             secure_storage::remove_secure_secret,
@@ -107,6 +135,7 @@ fn main() {
             host::read_local_file_bounded,
             host::read_file_custom,
             host::write_file,
+            host::write_patch_file,
             host::move_file,
             host::rename_file,
             host::get_symlink_info,
@@ -135,6 +164,7 @@ fn main() {
 
     application.run(|app, event| {
         if matches!(event, tauri::RunEvent::Exit) {
+            debug::shutdown();
             if let Some(manager) = app.try_state::<Arc<logging::LogManager>>() {
                 manager.shutdown();
             }

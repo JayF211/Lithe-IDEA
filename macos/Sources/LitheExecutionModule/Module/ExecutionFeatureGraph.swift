@@ -24,9 +24,14 @@ package final class ExecutionFeatureGraph: NSObject, ExecutionServiceGraph {
         run.configureMavenContextProvider { [weak maven] in
             maven?.launchContext
         }
+        maven.onProjectReloaded = { [weak run] workspace, project in
+            run?.acceptMavenProject(project, at: workspace)
+        }
     }
 
-    package var isActive: Bool { maven.isRunning || run.isRunning || tests.isRunning }
+    package var isActive: Bool {
+        maven.isRunning || maven.isResolvingDependencies || maven.isReloading || run.isRunning || tests.isRunning
+    }
     package var hasActiveExecutionWork: Bool { isActive }
     package func activate(context: ModuleContext) {
         configureModuleLeases { reason in context.leases.acquireLease(reason: reason) }
@@ -36,14 +41,19 @@ package final class ExecutionFeatureGraph: NSObject, ExecutionServiceGraph {
     }
 
     package func configureModuleLeases(acquire: @escaping @MainActor (String) -> ModuleLease) {
-        maven.$taskState.map { state in
-            switch state {
+        Publishers.CombineLatest3(maven.$taskState, maven.$dependencyStates, maven.$isReloading).map { state, dependencies, reloading in
+            let buildIsActive = switch state {
             case .running, .stopping: true
             case .idle, .cancelled, .failed: false
             }
+            let dependenciesAreActive = dependencies.values.contains {
+                if case .loading = $0 { return true }
+                return false
+            }
+            return buildIsActive || dependenciesAreActive || reloading
         }.removeDuplicates().sink { [weak self] active in
             guard let self else { return }
-            if active, mavenLease == nil { mavenLease = acquire("Maven build is running") }
+            if active, mavenLease == nil { mavenLease = acquire("Maven operation is running") }
             if !active { mavenLease?.release(); mavenLease = nil }
         }.store(in: &activityObservers)
         run.$isRunning.removeDuplicates().sink { [weak self] active in

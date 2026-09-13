@@ -1,4 +1,5 @@
 import AppKit
+import LitheCoreContracts
 import SwiftUI
 
 /// 项目树、标签页、面包屑和 Search Everywhere 共用的图标分类。
@@ -27,6 +28,7 @@ enum LitheIconKind: Hashable {
     case cppSource
     case csharpSource
     case scriptSource
+    case powershellSource
     case javaScript
     case css
     case html
@@ -87,6 +89,7 @@ enum LitheIcons {
         .cppSource: "fileTypes/cpp.svg",
         .csharpSource: "fileTypes/csharp.svg",
         .scriptSource: "fileTypes/shell.svg",
+        .powershellSource: "fileTypes/powershell.svg",
         .javaScript: "fileTypes/javaScript.svg",
         .css: "fileTypes/css.svg",
         .html: "fileTypes/html.svg",
@@ -155,6 +158,17 @@ enum LitheIcons {
         )
     }
 
+    static func kind(for directoryMark: WorkspaceDirectoryMark) -> LitheIconKind {
+        switch directoryMark {
+        case .plain: .folder
+        case .sources: .sourceFolder
+        case .resources: .resourceFolder
+        case .excluded: .excludedFolder
+        case .module: .moduleFolder
+        case .package: .packageFolder
+        }
+    }
+
     static func kind(forFilePath path: String) -> LitheIconKind {
         let fileName = (path as NSString).lastPathComponent
         return fileKind(
@@ -177,6 +191,18 @@ enum LitheIcons {
         let resourceName = filename.deletingPathExtension
         let darkFilename = "\(resourceName)_dark.\(filename.pathExtension)"
         return directory.isEmpty ? darkFilename : "\(directory)/\(darkFilename)"
+    }
+
+    /// Returns the light-theme sibling for folder assets whose base SVG uses
+    /// IntelliJ's dark palette. The sibling keeps the original path data so
+    /// switching appearance changes only color, never silhouette.
+    static func lightIdeaAssetPath(for resourcePath: String) -> String {
+        let path = resourcePath as NSString
+        let directory = path.deletingLastPathComponent
+        let filename = path.lastPathComponent as NSString
+        let resourceName = filename.deletingPathExtension
+        let lightFilename = "\(resourceName)_light.\(filename.pathExtension)"
+        return directory.isEmpty ? lightFilename : "\(directory)/\(lightFilename)"
     }
 
     /// Maps the editor gutter breakpoint state to the matching IntelliJ
@@ -265,6 +291,7 @@ enum LitheIcons {
         case "cs": return .csharpSource
         case "js", "jsx", "mjs", "cjs", "ts", "tsx": return .javaScript
         case "sh", "zsh", "bash", "fish": return .scriptSource
+        case "ps1", "psm1", "psd1", "ps1xml", "psc1", "pssc": return .powershellSource
         case "css", "scss", "sass", "less": return .css
         case "html", "htm", "xhtml", "vue", "svelte": return .html
         case "toml": return .toml
@@ -389,6 +416,7 @@ enum LitheIcons {
         case .cppSource: .document(accent: Color(red: 0.71, green: 0.54, blue: 0.93), mark: .letter("C"))
         case .csharpSource: .document(accent: Color(red: 0.37, green: 0.68, blue: 0.40), mark: .letter("C"))
         case .scriptSource: .document(accent: Color(red: 0.85, green: 0.76, blue: 0.32), mark: .braces)
+        case .powershellSource: .document(accent: Color(red: 0.33, green: 0.63, blue: 0.86), mark: .none)
         case .javaScript: .document(accent: Color(red: 0.95, green: 0.77, blue: 0.36), mark: .letter("J"))
         case .css: .document(accent: Color(red: 0.33, green: 0.54, blue: 0.97), mark: .letter("C"))
         case .html: .document(accent: Color(red: 0.34, green: 0.59, blue: 0.36), mark: .angleBrackets)
@@ -433,9 +461,28 @@ enum LitheIcons {
     /// Loads an imported IntelliJ SVG from the app bundle. Keeping this lookup
     /// behind the same catalog lets the sidebar, tabs and breadcrumbs reuse it.
     @MainActor
-    static func ideaImage(for kind: LitheIconKind) -> NSImage? {
+    static func ideaImage(for kind: LitheIconKind, isDark: Bool = false) -> NSImage? {
         guard let assetPath = ideaAssetPaths[kind] else { return nil }
+        if !isDark,
+           isFolderKind(kind),
+           let lightImage = ideaImage(resourcePath: lightIdeaAssetPath(for: assetPath)) {
+            return lightImage
+        }
+        if isDark,
+           let darkImage = ideaImage(resourcePath: darkIdeaAssetPath(for: assetPath)) {
+            return darkImage
+        }
         return ideaImage(resourcePath: assetPath)
+    }
+
+    private static func isFolderKind(_ kind: LitheIconKind) -> Bool {
+        switch kind {
+        case .folder, .sourceFolder, .resourceFolder,
+             .excludedFolder, .moduleFolder, .packageFolder:
+            true
+        default:
+            false
+        }
     }
 
     /// Loads an arbitrary imported IntelliJ SVG. This is used for chrome icons
@@ -522,15 +569,10 @@ struct LitheIcon: View {
     var size: CGFloat = 14
 
     var body: some View {
-        if let image = LitheIcons.ideaImage(for: kind) {
+        if let image = LitheIcons.ideaImage(for: kind, isDark: colorScheme == .dark) {
             Image(nsImage: image)
                 .resizable()
                 .interpolation(.high)
-                // IntelliJ's catalog is authored against a dark canvas. A
-                // small contrast normalization keeps its semantic colors
-                // legible on light surfaces without turning them monochrome.
-                .saturation(colorScheme == .light ? 0.94 : 1)
-                .contrast(colorScheme == .light ? 0.90 : 1)
                 .frame(width: size, height: size)
         } else {
             switch LitheIcons.appearance(for: kind) {

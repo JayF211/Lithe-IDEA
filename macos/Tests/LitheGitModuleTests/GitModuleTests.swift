@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 import LitheApplicationKernel
 @testable import LitheGitModule
@@ -6,6 +7,36 @@ import Testing
 
 @MainActor
 struct GitModuleTests {
+    @Test
+    func patchDiscoveryKeepsFilesSelectableAfterAnEncodingFailure() async throws {
+        let good = GitPatchFile(path: "good.txt", originalPath: nil, additions: 1, deletions: 0)
+        let legacy = GitPatchFile(path: "legacy.txt", originalPath: nil, additions: 1, deletions: 0)
+        let service = GitService(operations: TestGitOperations(exportPatchHandler: { paths, metadataOnly in
+            if metadataOnly { return .success(GitPatchExport(patch: "", files: [good, legacy], byteLength: 0)) }
+            if paths.contains("legacy.txt") { return .failure(GitPatchFailure("Non-UTF-8 patch")) }
+            return .success(GitPatchExport(patch: "selected UTF-8 patch", files: [good], byteLength: 20))
+        }))
+        let feature = GitPatchFeatureModel(service: service) { _, _, _, _ in nil }
+        defer { feature.reset() }
+        feature.beginExport(at: URL(fileURLWithPath: "/workspace"))
+        // Observe the public busy boundary with the existing bounded helper;
+        // reset owns task cancellation even when an assertion fails.
+        try #require(await waitForGitWorkToBecomeIdle { feature.isBusy })
+        #expect(feature.files == [good, legacy])
+        #expect(feature.exportPreview == nil)
+        #expect(feature.canGenerateExport)
+        feature.generateExport()
+        try #require(await waitForGitWorkToBecomeIdle { feature.isBusy })
+        #expect(feature.errorMessage == "Non-UTF-8 patch")
+        #expect(feature.files == [good, legacy])
+        feature.selectPath("legacy.txt", included: false)
+        feature.generateExport()
+        try #require(await waitForGitWorkToBecomeIdle { feature.isBusy })
+        #expect(feature.errorMessage == nil)
+        #expect(feature.exportPreview?.files == [good])
+        #expect(feature.canSave)
+    }
+
     @Test
     func treeStatusProjectsExactFilesAndHighestPriorityDirectories() {
         let root = URL(fileURLWithPath: "/workspace")
@@ -318,6 +349,91 @@ struct GitModuleTests {
     }
 
     @Test
+    func gitRefreshCombinesChangesFromDiscoveredWorkspaceRepositories() async {
+        let workspace = URL(fileURLWithPath: "/workspace")
+        let firstRoot = workspace.appendingPathComponent("service-a", isDirectory: true)
+        let secondRoot = workspace.appendingPathComponent("service-b", isDirectory: true)
+        let firstChange = GitChange(
+            repositoryRoot: firstRoot,
+            path: "src/App.swift",
+            originalPath: nil,
+            indexStatus: "M",
+            workTreeStatus: "M"
+        )
+        let secondChange = GitChange(
+            repositoryRoot: secondRoot,
+            path: "src/App.swift",
+            originalPath: nil,
+            indexStatus: "U",
+            workTreeStatus: "U"
+        )
+        let service = GitService(operations: TestGitOperations(
+            snapshotsByRoot: [
+                firstRoot.standardizedFileURL.path: GitSnapshot(
+                    repositoryRoot: firstRoot,
+                    branch: "main",
+                    changes: [firstChange]
+                ),
+                secondRoot.standardizedFileURL.path: GitSnapshot(
+                    repositoryRoot: secondRoot,
+                    branch: "develop",
+                    changes: [secondChange]
+                )
+            ],
+            repositoryRoots: [firstRoot, secondRoot],
+            commitResult: GitProcessResult(arguments: ["commit"], output: "committed", exitCode: 0)
+        ))
+        let feature = GitFeatureModel(service: service)
+        feature.configure(
+            workspaceURLProvider: { workspace },
+            isGitLogVisibleProvider: { false },
+            notify: { _ in },
+            onStateRefreshed: {}
+        )
+
+        await feature.refreshGit()
+
+        #expect(feature.availableRepositoryRoots == [firstRoot, secondRoot])
+        #expect(feature.gitChanges == [firstChange, secondChange])
+        #expect(feature.currentBranch == "main")
+        #expect(feature.activeRepositoryChanges == [firstChange])
+        // A conflict or staged entry in another repository must not block this commit.
+        #expect(await feature.commitStagedChanges(message: "First repository", amend: false))
+        #expect(firstChange.id != secondChange.id)
+        #expect(feature.gitTreeStatus.change(relativePath: firstChange.url.path) == firstChange)
+        #expect(feature.gitTreeStatus.change(relativePath: secondChange.url.path) == secondChange)
+        await feature.selectRepository(secondRoot)
+        #expect(feature.gitRepositoryRoot == secondRoot)
+        #expect(feature.currentBranch == "develop")
+        #expect(feature.activeRepositoryChanges == [secondChange])
+        #expect(await !feature.commitStagedChanges(message: "Conflicted repository", amend: false))
+        #expect(feature.gitChanges == [firstChange, secondChange])
+    }
+
+    @Test
+    func gitServiceRecordsElapsedTimeForHistoryOperations() async {
+        let root = URL(fileURLWithPath: "/workspace")
+        let logger = GitPerformanceLogRecorder()
+        let service = GitService(
+            operations: TestGitOperations(historyValue: GitHistorySnapshot(
+                references: [],
+                recentReferences: [],
+                commits: [],
+                hasMore: false
+            )),
+            performanceLogger: logger
+        )
+
+        _ = await service.history(at: root, limit: 30)
+
+        let messages = logger.messages
+        #expect(messages.count == 1)
+        #expect(messages.first?.contains("operation=history") == true)
+        #expect(messages.first?.contains("duration_ms=") == true)
+        #expect(messages.first?.contains("status=success") == true)
+    }
+
+    @Test
     func gitHistoryPublishesRecentReferencesInCoreOrder() async {
         let root = URL(fileURLWithPath: "/workspace")
         let main = GitReference(
@@ -354,6 +470,204 @@ struct GitModuleTests {
         await feature.refreshGit()
 
         #expect(feature.recentGitReferences.map(\.shortName) == ["main", "feature/recent"])
+    }
+
+    @Test
+    func gitHistoryAppendsTheNextPageWithoutReplacingEarlierCommits() async {
+        let root = URL(fileURLWithPath: "/workspace")
+        let commits = (0..<3).map { index in
+            GitCommit(
+                hash: "hash-\(index)",
+                shortHash: "short-\(index)",
+                parentHashes: [],
+                authorName: "Lithe Test",
+                authorEmail: "test@example.com",
+                date: "2026/09/01 10:0\(index)",
+                subject: "commit-\(index)",
+                decorations: ""
+            )
+        }
+        let service = GitService(operations: TestGitOperations(
+            snapshotValue: GitSnapshot(repositoryRoot: root, branch: "main", changes: []),
+            referencesValue: GitReferenceSnapshot(
+                references: [],
+                recentReferences: [],
+                identity: GitIdentity(name: "Lithe Test", email: "test@example.com")
+            ),
+            historyPageValues: [
+                "": GitHistoryPage(
+                    commits: Array(commits.prefix(2)),
+                    nextCursor: "cursor-2",
+                    hasMore: true
+                ),
+                "cursor-2": GitHistoryPage(
+                    commits: [commits[2]],
+                    nextCursor: nil,
+                    hasMore: false
+                )
+            ]
+        ))
+        let feature = GitFeatureModel(service: service)
+        feature.configure(
+            workspaceURLProvider: { root },
+            isGitLogVisibleProvider: { true },
+            notify: { _ in },
+            onStateRefreshed: {}
+        )
+
+        await feature.refreshGit()
+        #expect(feature.gitCommits.map(\.hash) == ["hash-0", "hash-1"])
+        #expect(feature.canLoadMoreGitHistory)
+
+        await feature.loadMoreGitHistory()
+
+        #expect(feature.gitCommits.map(\.hash) == ["hash-0", "hash-1", "hash-2"])
+        #expect(!feature.canLoadMoreGitHistory)
+    }
+
+    @Test
+    func repositoryGraphIsSeparateFromVisiblePagingAndReleasesItsCursor() async {
+        let root = URL(fileURLWithPath: "/workspace")
+        let probe = GitGraphHistoryProbe()
+        let feature = GitFeatureModel(service: GitService(operations: TestGitOperations(
+            snapshotValue: GitSnapshot(repositoryRoot: root, branch: "main", changes: []), graphHistoryProbe: probe
+        )))
+        feature.configure(workspaceURLProvider: { root }, isGitLogVisibleProvider: { true }, notify: { _ in }, onStateRefreshed: {})
+        defer { feature.reset() }
+
+        await feature.refreshGit()
+        #expect(feature.gitCommits.map(\.hash) == ["visible"])
+        #expect(feature.gitGraphRepositoryCommits.map(\.hash) == ["other-branch", "visible"])
+        #expect(feature.canLoadMoreGitHistory)
+        #expect(probe.closedCursors == ["graph-cursor"])
+        #expect(probe.requestedAllReferences)
+        let version = feature.gitGraphRepositoryVersion
+        await feature.loadMoreGitHistory()
+        #expect(feature.gitCommits.map(\.hash) == ["visible", "older"])
+        #expect(feature.gitGraphRepositoryVersion == version)
+
+        probe.failGraphRequest()
+        await feature.refreshGitHistory()
+        #expect(feature.gitGraphRepositoryCommits.isEmpty)
+        #expect(feature.gitCommits.map(\.hash) == ["visible"])
+        #expect(feature.gitGraphRepositoryVersion > version)
+    }
+
+    @Test
+    func visibleHistoryPublishesBeforeRepositoryGraphCompletes() async {
+        let root = URL(fileURLWithPath: "/workspace")
+        let probe = GitGraphHistoryProbe(blockGraph: true)
+        let feature = GitFeatureModel(service: GitService(operations: TestGitOperations(
+            snapshotValue: GitSnapshot(repositoryRoot: root, branch: "main", changes: []), graphHistoryProbe: probe
+        )))
+        feature.configure(workspaceURLProvider: { root }, isGitLogVisibleProvider: { true }, notify: { _ in }, onStateRefreshed: {})
+        let visiblePublished = GitModuleTestGate()
+        let observation = feature.$gitCommits.sink { commits in
+            if commits.map(\.hash) == ["visible"] { visiblePublished.open() }
+        }
+        let refresh = Task { await feature.refreshGit() }
+        defer { observation.cancel(); probe.release.open(); refresh.cancel(); feature.reset() }
+
+        #expect(await probe.started.waitUntilOpen())
+        #expect(await visiblePublished.waitUntilOpen())
+        #expect(feature.gitCommits.map(\.hash) == ["visible"])
+        #expect(!feature.isLoadingGitHistory)
+        #expect(feature.canLoadMoreGitHistory)
+        #expect(feature.gitGraphRepositoryCommits.isEmpty)
+        // Paging remains usable while the repository context is on its worker.
+        await feature.loadMoreGitHistory()
+        #expect(feature.gitCommits.map(\.hash) == ["visible", "older"])
+        probe.release.open()
+        await refresh.value
+        #expect(!probe.didTimeOut)
+        #expect(feature.gitGraphRepositoryCommits.map(\.hash) == ["other-branch", "visible"])
+        #expect(feature.gitCommits.map(\.hash) == ["visible", "older"])
+        #expect(probe.closedCursors == ["graph-cursor"])
+    }
+
+    @Test
+    func supersededRepositoryGraphCannotReplaceNewContext() async {
+        let root = URL(fileURLWithPath: "/workspace")
+        // The first worker deliberately returns after cancellation and after
+        // the second refresh, as a native operation racing cancellation can.
+        let probe = GitGraphHistoryProbe(blockGraph: true, releaseOnCancel: false)
+        let feature = GitFeatureModel(service: GitService(operations: TestGitOperations(
+            snapshotValue: GitSnapshot(repositoryRoot: root, branch: "main", changes: []), graphHistoryProbe: probe
+        )))
+        feature.configure(workspaceURLProvider: { root }, isGitLogVisibleProvider: { true }, notify: { _ in }, onStateRefreshed: {})
+        let refresh = Task { await feature.refreshGit() }
+        defer { probe.release.open(); refresh.cancel(); feature.reset() }
+        #expect(await probe.started.waitUntilOpen())
+
+        await feature.showAllGitReferences()
+        #expect(feature.isShowingAllGitReferences)
+        #expect(feature.gitGraphRepositoryCommits.map(\.hash) == ["other-branch", "visible"])
+        let version = feature.gitGraphRepositoryVersion
+        probe.release.open()
+        await refresh.value
+        #expect(!probe.didTimeOut)
+        #expect(feature.gitGraphRepositoryVersion == version)
+        #expect(feature.gitCommits.map(\.hash) == ["visible"])
+        #expect(probe.closedCursors.filter { $0 == "graph-cursor" }.count == 2)
+    }
+
+    @Test
+    func cancelledRepositoryGraphCannotPublishIntoAResetWorkspace() async {
+        let root = URL(fileURLWithPath: "/workspace")
+        let probe = GitGraphHistoryProbe(blockGraph: true)
+        let feature = GitFeatureModel(service: GitService(operations: TestGitOperations(
+            snapshotValue: GitSnapshot(repositoryRoot: root, branch: "main", changes: []), graphHistoryProbe: probe
+        )))
+        feature.configure(workspaceURLProvider: { root }, isGitLogVisibleProvider: { true }, notify: { _ in }, onStateRefreshed: {})
+        let refresh = Task { await feature.refreshGit() }
+        defer { probe.release.open(); refresh.cancel(); feature.reset() }
+        let started = await probe.started.waitUntilOpen()
+        feature.reset()
+        probe.release.open()
+        await refresh.value
+        #expect(started)
+        #expect(!probe.didTimeOut)
+        #expect(probe.graphWasCancelled)
+        #expect(Set(probe.closedCursors) == ["graph-cursor", "visible-cursor"])
+        #expect(feature.gitGraphRepositoryCommits.isEmpty)
+        #expect(feature.gitCommits.isEmpty)
+    }
+
+    @Test
+    func successfulRevertRefreshesVisibleGitHistoryAndFocusesCurrentHead() async {
+        let root = URL(fileURLWithPath: "/workspace")
+        let revertedCommit = makeTestCommit(hash: "original-commit", subject: "Original change")
+        let revertCommit = makeTestCommit(hash: "revert-commit", subject: "Revert original change")
+        let controller = GitHistoryMutationController(
+            before: [revertedCommit],
+            after: [revertCommit, revertedCommit]
+        )
+        let service = GitService(operations: TestGitOperations(
+            snapshotValue: GitSnapshot(repositoryRoot: root, branch: "main", changes: []),
+            historyPageHandler: { controller.historyPage() },
+            revertHandler: { hash in controller.revert(hash) }
+        ))
+        let feature = GitFeatureModel(service: service)
+        feature.configure(
+            workspaceURLProvider: { root },
+            isGitLogVisibleProvider: { true },
+            notify: { _ in },
+            onStateRefreshed: {}
+        )
+
+        await feature.refreshGit()
+        #expect(feature.gitCommits.map(\.hash) == [revertedCommit.hash])
+        await feature.showAllGitReferences()
+        #expect(feature.isShowingAllGitReferences)
+
+        await feature.revert(revertedCommit)
+
+        #expect(feature.gitCommits.map(\.hash) == [revertCommit.hash, revertedCommit.hash])
+        #expect(!feature.isShowingAllGitReferences)
+        #expect(feature.selectedGitCommit?.hash == revertCommit.hash)
+        #expect(controller.revertedHashes == [revertedCommit.hash])
+        // Each refresh loads the visible page and independent repository graph.
+        #expect(controller.historyCallCount == 8)
     }
 
     @Test
@@ -441,9 +755,713 @@ struct GitModuleTests {
         #expect(feature.gitConsoleEntries.first?.succeeded == true)
     }
 
-    @Test
-    func gitServicePreservesExecutedArgumentsAndWorkingDirectory() async {
+    @Test(arguments: [false, true])
+    func confirmedDiscardSurvivesDialogDismissal(untracked: Bool) async throws {
         let root = URL(fileURLWithPath: "/workspace")
+        let change = GitChange(repositoryRoot: root, path: "target.txt", originalPath: nil,
+                               indexStatus: untracked ? "?" : " ", workTreeStatus: untracked ? "?" : "M")
+        let service = GitService(operations: TestGitOperations(
+            snapshotValue: GitSnapshot(repositoryRoot: root, branch: "main", changes: []),
+            discardHandler: { target in
+                GitProcessResult(arguments: ["discard", target.path], output: "", standardOutput: "",
+                                 standardError: "", exitCode: 0)
+            }
+        ))
+        let feature = GitFeatureModel(service: service)
+        var notifications: [String] = []
+        feature.configure(workspaceURLProvider: { root }, isGitLogVisibleProvider: { false },
+                          notify: { notifications.append($0) }, onStateRefreshed: {})
+        await feature.refreshGit()
+        feature.clearGitConsole()
+        feature.requestDiscardChange(change)
+        let confirmed = try #require(feature.pendingDiscardChange)
+        // SwiftUI dismisses the dialog before the button's asynchronous operation starts.
+        feature.cancelDiscardChange()
+        #expect(feature.gitConsoleEntries.isEmpty)
+        await feature.confirmDiscardChange(confirmed)
+        #expect(feature.gitConsoleEntries.map(\.arguments) == [["discard", "target.txt"]])
+        #expect(notifications == ["Discarded target.txt"])
+        #expect(feature.pendingDiscardChange == nil)
+        #expect(feature.gitChanges.isEmpty)
+    }
+
+    @Test
+    func confirmedDiscardHunkSurvivesDialogDismissalAndReportsFailure() async throws {
+        let root = URL(fileURLWithPath: "/workspace")
+        let change = GitChange(repositoryRoot: root, path: "target.txt", originalPath: nil,
+                               indexStatus: " ", workTreeStatus: "M")
+        let hunk = DiffHunk(id: "h1", header: "@@ -1 +1 @@", patch: "confirmed patch")
+        let service = GitService(operations: TestGitOperations(
+            snapshotValue: GitSnapshot(repositoryRoot: root, branch: "main", changes: [change]),
+            applyPatchHandler: { patch, _, mode in
+                GitProcessResult(arguments: [mode, patch], output: "Patch no longer applies",
+                                 standardOutput: "", standardError: "Patch no longer applies", exitCode: 1)
+            }
+        ))
+        let feature = GitFeatureModel(service: service)
+        var notifications: [String] = []
+        feature.configure(workspaceURLProvider: { root }, isGitLogVisibleProvider: { false },
+                          notify: { notifications.append($0) }, onStateRefreshed: {})
+        await feature.refreshGit()
+        feature.clearGitConsole()
+        feature.requestDiscardHunk(hunk, in: change)
+        let confirmed = try #require(feature.pendingDiscardHunk)
+        feature.cancelDiscardHunk()
+        #expect(feature.gitConsoleEntries.isEmpty)
+        await feature.confirmDiscardHunk(confirmed)
+        #expect(feature.gitConsoleEntries.map(\.arguments) == [["discard", "confirmed patch"]])
+        #expect(notifications == ["Patch no longer applies"])
+        #expect(feature.pendingDiscardHunk == nil)
+        #expect(feature.gitChanges == [change])
+    }
+
+    // MARK: Tag management
+
+    @Test
+    func gitTagDeletionCapabilityRequiresACommitTarget() {
+        let commitTag = GitReference(
+            fullName: "refs/tags/v1.0",
+            shortName: "v1.0",
+            kind: .tag,
+            peelsToCommit: true,
+            isCurrent: false,
+            upstreamShortName: nil
+        )
+        let treeTag = GitReference(
+            fullName: "refs/tags/tree-tag",
+            shortName: "tree-tag",
+            kind: .tag,
+            peelsToCommit: false,
+            isCurrent: false,
+            upstreamShortName: nil
+        )
+
+        #expect(commitTag.supportsTagDeletion)
+        #expect(!treeTag.supportsTagDeletion)
+    }
+
+    private func makeTagTestFeature(
+        _ operations: TestGitOperations,
+        onNotify: @escaping @MainActor (String) -> Void = { _ in }
+    ) -> (GitFeatureModel, URL) {
+        let root = URL(fileURLWithPath: "/workspace")
+        let service = GitService(operations: operations)
+        let feature = GitFeatureModel(service: service)
+        feature.configure(
+            workspaceURLProvider: { root },
+            isGitLogVisibleProvider: { false },
+            notify: onNotify,
+            onStateRefreshed: {}
+        )
+        return (feature, root)
+    }
+
+    private func makeTagCommit() -> GitCommit {
+        GitCommit(
+            hash: "abc123def456",
+            shortHash: "abc123d",
+            parentHashes: [],
+            authorName: "Ada Lovelace",
+            authorEmail: "ada@example.com",
+            date: "2026/08/30 10:00",
+            subject: "Initial",
+            decorations: ""
+        )
+    }
+
+    @Test
+    func gitTagNameValidationMatchesTheSharedContractFixture() throws {
+        struct TagNames: Decodable {
+            let valid: [String]
+            let invalid: [String]
+        }
+
+        let fixtureURL = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent() // LitheGitModuleTests
+            .deletingLastPathComponent() // Tests
+            .deletingLastPathComponent() // macos
+            .deletingLastPathComponent() // repository root
+            .appendingPathComponent("shared/fixtures/git/tag-names.json")
+        let fixture = try JSONDecoder().decode(TagNames.self, from: Data(contentsOf: fixtureURL))
+
+        for name in fixture.valid {
+            #expect(GitTagNameValidator.isValid(name), "expected valid tag name: \(name)")
+        }
+        for name in fixture.invalid {
+            #expect(!GitTagNameValidator.isValid(name), "expected invalid tag name: \(name)")
+        }
+    }
+
+    @Test
+    func gitTagDeletionRequiresKindAndMessageToDescribeTheSameTagForm() {
+        #expect(GitTagDeletion(
+            name: "v1.0",
+            deletedTarget: "abc123def456",
+            kind: .lightweight,
+            message: nil
+        ).hasConsistentKindAndMessage)
+        #expect(GitTagDeletion(
+            name: "v1.0",
+            deletedTarget: "abc123def456",
+            kind: .annotated,
+            message: ""
+        ).hasConsistentKindAndMessage)
+        #expect(!GitTagDeletion(
+            name: "v1.0",
+            deletedTarget: "abc123def456",
+            kind: .lightweight,
+            message: "release"
+        ).hasConsistentKindAndMessage)
+        #expect(!GitTagDeletion(
+            name: "v1.0",
+            deletedTarget: "abc123def456",
+            kind: .annotated,
+            message: nil
+        ).hasConsistentKindAndMessage)
+    }
+
+    @Test
+    func gitTagCreationSucceedsSilentlyForTheDialogAndNotifiesOnSuccess() async {
+        var notifications: [String] = []
+        let (feature, _) = makeTagTestFeature(
+            TestGitOperations(
+                snapshotValue: GitSnapshot(repositoryRoot: URL(fileURLWithPath: "/workspace"), branch: "main", changes: []),
+                createTagResult: GitProcessResult(arguments: ["tag", "v1.0", "abc123def456"], output: "", exitCode: 0)
+            ),
+            onNotify: { notifications.append($0) }
+        )
+        await feature.refreshGit()
+
+        // An empty result would mean the dialog shows a generic failure, so a
+        // successful create must return nil and notify instead.
+        let error = await feature.createTag(at: makeTagCommit(), name: "v1.0", message: "")
+
+        #expect(error == nil)
+        #expect(notifications == ["Created tag v1.0"])
+    }
+
+    @Test
+    func gitTagCreationReturnsTheFailureToTheDialogWithoutNotifying() async {
+        var notifications: [String] = []
+        let (feature, _) = makeTagTestFeature(
+            TestGitOperations(
+                snapshotValue: GitSnapshot(repositoryRoot: URL(fileURLWithPath: "/workspace"), branch: "main", changes: [])
+            ),
+            onNotify: { notifications.append($0) }
+        )
+        await feature.refreshGit()
+
+        let error = await feature.createTag(at: makeTagCommit(), name: "v1.0", message: "")
+
+        #expect(error == "Rust Core Git operation failed")
+        #expect(notifications.isEmpty)
+    }
+
+    @Test
+    func gitTagDeletionKeepsARestorableSessionRecord() async {
+        var notifications: [String] = []
+        let (feature, _) = makeTagTestFeature(
+            TestGitOperations(
+                snapshotValue: GitSnapshot(repositoryRoot: URL(fileURLWithPath: "/workspace"), branch: "main", changes: []),
+                deleteTagResult: GitProcessResult(
+                    arguments: ["tag", "-d", "v1.0"],
+                    output: "Deleted tag 'v1.0'\n",
+                    exitCode: 0,
+                    tagDeletion: GitTagDeletion(
+                        name: "v1.0",
+                        deletedTarget: "abc123def456",
+                        kind: .annotated,
+                        message: "release"
+                    )
+                )
+            ),
+            onNotify: { notifications.append($0) }
+        )
+        await feature.refreshGit()
+        let reference = GitReference(
+            fullName: "refs/tags/v1.0",
+            shortName: "v1.0",
+            kind: .tag,
+            isCurrent: false,
+            upstreamShortName: nil
+        )
+
+        await feature.deleteTag(reference)
+
+        #expect(feature.recentlyDeletedTag == GitTagDeletion(
+            name: "v1.0",
+            deletedTarget: "abc123def456",
+            kind: .annotated,
+            message: "release"
+        ))
+        #expect(notifications == ["Deleted tag v1.0"])
+
+        feature.dismissDeletedTagBanner()
+        #expect(feature.recentlyDeletedTag == nil)
+    }
+
+    @Test
+    func gitTagDeletionFailureRecordsNothingAndNotifiesTheError() async {
+        var notifications: [String] = []
+        let (feature, _) = makeTagTestFeature(
+            TestGitOperations(
+                snapshotValue: GitSnapshot(repositoryRoot: URL(fileURLWithPath: "/workspace"), branch: "main", changes: []),
+                deleteTagResult: GitProcessResult(
+                    arguments: ["tag", "-d", "v1.0"],
+                    output: "The tag 'v1.0' does not exist",
+                    exitCode: 1
+                )
+            ),
+            onNotify: { notifications.append($0) }
+        )
+        await feature.refreshGit()
+        let reference = GitReference(
+            fullName: "refs/tags/v1.0",
+            shortName: "v1.0",
+            kind: .tag,
+            isCurrent: false,
+            upstreamShortName: nil
+        )
+
+        await feature.deleteTag(reference)
+
+        #expect(feature.recentlyDeletedTag == nil)
+        #expect(notifications == ["The tag 'v1.0' does not exist"])
+    }
+
+    @Test
+    func gitTagDeletionFailureKeepsThePreviousRecoveryRecord() async {
+        var notifications: [String] = []
+        let results = GitProcessResultQueue([
+            GitProcessResult(
+                arguments: ["tag", "-d", "v1.0"],
+                output: "Deleted tag 'v1.0'\n",
+                exitCode: 0,
+                tagDeletion: GitTagDeletion(
+                    name: "v1.0",
+                    deletedTarget: "abc123def456",
+                    kind: .lightweight,
+                    message: nil
+                )
+            ),
+            GitProcessResult(
+                arguments: ["tag", "-d", "missing"],
+                output: "The tag 'missing' does not exist",
+                exitCode: 1
+            )
+        ])
+        let (feature, _) = makeTagTestFeature(
+            TestGitOperations(
+                snapshotValue: GitSnapshot(repositoryRoot: URL(fileURLWithPath: "/workspace"), branch: "main", changes: []),
+                deleteTagResults: results
+            ),
+            onNotify: { notifications.append($0) }
+        )
+        await feature.refreshGit()
+
+        for name in ["v1.0", "missing"] {
+            await feature.deleteTag(GitReference(
+                fullName: "refs/tags/\(name)",
+                shortName: name,
+                kind: .tag,
+                isCurrent: false,
+                upstreamShortName: nil
+            ))
+        }
+
+        #expect(feature.recentlyDeletedTag?.name == "v1.0")
+        #expect(notifications == ["Deleted tag v1.0", "The tag 'missing' does not exist"])
+    }
+
+    @Test
+    func gitTagRestoreReplaysRecordedNameTargetAndMessage() async {
+        var notifications: [String] = []
+        let recorder = TagCallRecorder()
+        let (feature, _) = makeTagTestFeature(
+            TestGitOperations(
+                snapshotValue: GitSnapshot(repositoryRoot: URL(fileURLWithPath: "/workspace"), branch: "main", changes: []),
+                createTagResult: GitProcessResult(arguments: ["tag", "-a", "v1.0", "-m", "release", "abc123def456"], output: "", exitCode: 0),
+                deleteTagResult: GitProcessResult(
+                    arguments: ["tag", "-d", "v1.0"],
+                    output: "Deleted tag 'v1.0'\n",
+                    exitCode: 0,
+                    tagDeletion: GitTagDeletion(
+                        name: "v1.0",
+                        deletedTarget: "abc123def456",
+                        kind: .annotated,
+                        message: "release"
+                    )
+                ),
+                tagCallRecorder: recorder
+            ),
+            onNotify: { notifications.append($0) }
+        )
+        await feature.refreshGit()
+        let reference = GitReference(
+            fullName: "refs/tags/v1.0",
+            shortName: "v1.0",
+            kind: .tag,
+            isCurrent: false,
+            upstreamShortName: nil
+        )
+
+        await feature.deleteTag(reference)
+        await feature.restoreRecentlyDeletedTag()
+
+        // Exactly one delete and one restore create must have run, and the
+        // restore must replay exactly the recorded deletion record so the
+        // rebuilt annotated tag points at the original commit with its
+        // message. The delete itself records no revision.
+        #expect(recorder.recorded.count == 2)
+        #expect(recorder.recorded.first?.name == "v1.0")
+        #expect(recorder.recorded.last == TagCallRecorder.Call(
+            name: "v1.0",
+            revision: "abc123def456",
+            message: "release"
+        ))
+        #expect(feature.recentlyDeletedTag == nil)
+        #expect(notifications == ["Deleted tag v1.0", "Restored tag v1.0"])
+    }
+
+    @Test
+    func gitTagRestoreFailureKeepsTheRecordForARetry() async {
+        var notifications: [String] = []
+        let (feature, _) = makeTagTestFeature(
+            TestGitOperations(
+                snapshotValue: GitSnapshot(repositoryRoot: URL(fileURLWithPath: "/workspace"), branch: "main", changes: []),
+                createTagResult: GitProcessResult(
+                    arguments: ["tag", "v1.0", "abc123def456"],
+                    output: "A tag named 'v1.0' already exists",
+                    exitCode: 1
+                ),
+                deleteTagResult: GitProcessResult(
+                    arguments: ["tag", "-d", "v1.0"],
+                    output: "Deleted tag 'v1.0'\n",
+                    exitCode: 0,
+                    tagDeletion: GitTagDeletion(
+                        name: "v1.0",
+                        deletedTarget: "abc123def456",
+                        kind: .lightweight,
+                        message: nil
+                    )
+                )
+            ),
+            onNotify: { notifications.append($0) }
+        )
+        await feature.refreshGit()
+        let reference = GitReference(
+            fullName: "refs/tags/v1.0",
+            shortName: "v1.0",
+            kind: .tag,
+            isCurrent: false,
+            upstreamShortName: nil
+        )
+
+        await feature.deleteTag(reference)
+        await feature.restoreRecentlyDeletedTag()
+
+        // The user can retry after fixing the conflict, or close the banner.
+        #expect(feature.recentlyDeletedTag?.name == "v1.0")
+        #expect(notifications == ["Deleted tag v1.0", "A tag named 'v1.0' already exists"])
+    }
+
+    @Test
+    func gitTagRestoreRejectsAnInconsistentRecoveryRecord() async {
+        var notifications: [String] = []
+        let recorder = TagCallRecorder()
+        let (feature, _) = makeTagTestFeature(
+            TestGitOperations(
+                snapshotValue: GitSnapshot(repositoryRoot: URL(fileURLWithPath: "/workspace"), branch: "main", changes: []),
+                createTagResult: GitProcessResult(arguments: ["tag", "v1.0"], output: "", exitCode: 0),
+                deleteTagResult: GitProcessResult(
+                    arguments: ["tag", "-d", "v1.0"],
+                    output: "Deleted tag 'v1.0'\n",
+                    exitCode: 0,
+                    tagDeletion: GitTagDeletion(
+                        name: "v1.0",
+                        deletedTarget: "abc123def456",
+                        kind: .lightweight,
+                        message: "unexpected annotation"
+                    )
+                ),
+                tagCallRecorder: recorder
+            ),
+            onNotify: { notifications.append($0) }
+        )
+        await feature.refreshGit()
+        let reference = GitReference(
+            fullName: "refs/tags/v1.0",
+            shortName: "v1.0",
+            kind: .tag,
+            isCurrent: false,
+            upstreamShortName: nil
+        )
+
+        await feature.deleteTag(reference)
+        await feature.restoreRecentlyDeletedTag()
+
+        #expect(feature.recentlyDeletedTag == nil)
+        #expect(recorder.recorded.count == 1, "invalid recovery data must not issue createTag")
+        #expect(notifications == ["Deleted tag v1.0", "The deleted tag recovery record is invalid"])
+    }
+
+    @Test
+    func gitFeatureModelResetClearsTheRestorableTagRecord() async {
+        var notifications: [String] = []
+        let (feature, _) = makeTagTestFeature(
+            TestGitOperations(
+                snapshotValue: GitSnapshot(repositoryRoot: URL(fileURLWithPath: "/workspace"), branch: "main", changes: []),
+                deleteTagResult: GitProcessResult(
+                    arguments: ["tag", "-d", "v1.0"],
+                    output: "Deleted tag 'v1.0'\n",
+                    exitCode: 0,
+                    tagDeletion: GitTagDeletion(
+                        name: "v1.0",
+                        deletedTarget: "abc123def456",
+                        kind: .lightweight,
+                        message: nil
+                    )
+                )
+            ),
+            onNotify: { notifications.append($0) }
+        )
+        await feature.refreshGit()
+        let reference = GitReference(
+            fullName: "refs/tags/v1.0",
+            shortName: "v1.0",
+            kind: .tag,
+            isCurrent: false,
+            upstreamShortName: nil
+        )
+
+        await feature.deleteTag(reference)
+        #expect(feature.recentlyDeletedTag != nil)
+
+        // Project close resets the model; the deletion record must not survive
+        // into the next session.
+        feature.reset()
+        #expect(feature.recentlyDeletedTag == nil)
+    }
+
+    // MARK: Branch deletion restore
+
+    @Test
+    func gitBranchDeletionKeepsARestorableSessionRecord() async {
+        var notifications: [String] = []
+        let (feature, _) = makeTagTestFeature(
+            TestGitOperations(
+                snapshotValue: GitSnapshot(repositoryRoot: URL(fileURLWithPath: "/workspace"), branch: "main", changes: []),
+                deleteBranchResult: GitProcessResult(
+                    arguments: ["branch", "-d", "--", "feature/short-lived"],
+                    output: "Deleted branch feature/short-lived\n",
+                    exitCode: 0,
+                    branchDeletion: GitBranchDeletion(
+                        name: "feature/short-lived",
+                        deletedTarget: "abc123def456"
+                    )
+                )
+            ),
+            onNotify: { notifications.append($0) }
+        )
+        await feature.refreshGit()
+        let reference = GitReference(
+            fullName: "refs/heads/feature/short-lived",
+            shortName: "feature/short-lived",
+            kind: .local,
+            isCurrent: false,
+            upstreamShortName: nil
+        )
+
+        await feature.deleteBranch(reference)
+
+        #expect(feature.recentlyDeletedBranch == GitBranchDeletion(
+            name: "feature/short-lived",
+            deletedTarget: "abc123def456"
+        ))
+        #expect(notifications == ["Deleted branch feature/short-lived"])
+
+        feature.dismissDeletedBranchBanner()
+        #expect(feature.recentlyDeletedBranch == nil)
+    }
+
+    @Test
+    func gitBranchConfigCleanupFailureKeepsTheRestorableDeletionRecord() async {
+        var notifications: [String] = []
+        let warning = "Could not remove configuration for deleted branch 'feature/short-lived'"
+        let (feature, _) = makeTagTestFeature(
+            TestGitOperations(
+                snapshotValue: GitSnapshot(repositoryRoot: URL(fileURLWithPath: "/workspace"), branch: "main", changes: []),
+                deleteBranchResult: GitProcessResult(
+                    arguments: ["update-ref", "-d", "refs/heads/feature/short-lived"],
+                    output: "",
+                    exitCode: 0,
+                    branchDeletion: GitBranchDeletion(
+                        name: "feature/short-lived",
+                        deletedTarget: "abc123def456"
+                    ),
+                    warnings: [GitOperationWarning(
+                        code: "branch_config_cleanup_failed",
+                        message: warning
+                    )]
+                )
+            ),
+            onNotify: { notifications.append($0) }
+        )
+        await feature.refreshGit()
+        let reference = GitReference(
+            fullName: "refs/heads/feature/short-lived",
+            shortName: "feature/short-lived",
+            kind: .local,
+            isCurrent: false,
+            upstreamShortName: nil
+        )
+
+        await feature.deleteBranch(reference)
+
+        #expect(feature.recentlyDeletedBranch == GitBranchDeletion(
+            name: "feature/short-lived",
+            deletedTarget: "abc123def456"
+        ))
+        #expect(notifications == ["Deleted branch feature/short-lived: \(warning)"])
+    }
+
+    @Test
+    func gitBranchDeletionFailureKeepsThePreviousRecoveryRecord() async {
+        var notifications: [String] = []
+        let results = GitProcessResultQueue([
+            GitProcessResult(
+                arguments: ["branch", "-d", "--", "feature/a"],
+                output: "Deleted branch feature/a\n",
+                exitCode: 0,
+                branchDeletion: GitBranchDeletion(name: "feature/a", deletedTarget: "abc123def456")
+            ),
+            GitProcessResult(
+                arguments: ["branch", "-d", "--", "feature/b"],
+                output: "The branch 'feature/b' does not exist",
+                exitCode: 1
+            )
+        ])
+        let (feature, _) = makeTagTestFeature(
+            TestGitOperations(
+                snapshotValue: GitSnapshot(repositoryRoot: URL(fileURLWithPath: "/workspace"), branch: "main", changes: []),
+                deleteBranchResults: results
+            ),
+            onNotify: { notifications.append($0) }
+        )
+        await feature.refreshGit()
+
+        await feature.deleteBranch(GitReference(
+            fullName: "refs/heads/feature/a",
+            shortName: "feature/a",
+            kind: .local,
+            isCurrent: false,
+            upstreamShortName: nil
+        ))
+        #expect(feature.recentlyDeletedBranch?.name == "feature/a")
+
+        await feature.deleteBranch(GitReference(
+            fullName: "refs/heads/feature/b",
+            shortName: "feature/b",
+            kind: .local,
+            isCurrent: false,
+            upstreamShortName: nil
+        ))
+
+        #expect(feature.recentlyDeletedBranch?.name == "feature/a")
+        #expect(notifications == ["Deleted branch feature/a", "The branch 'feature/b' does not exist"])
+    }
+
+    @Test
+    func gitTagAndBranchRecoveryRecordsCanCoexist() async {
+        let (feature, _) = makeTagTestFeature(TestGitOperations(
+            snapshotValue: GitSnapshot(repositoryRoot: URL(fileURLWithPath: "/workspace"), branch: "main", changes: []),
+            deleteTagResult: GitProcessResult(
+                arguments: ["tag", "-d", "v1.0"],
+                output: "Deleted tag 'v1.0'\n",
+                exitCode: 0,
+                tagDeletion: GitTagDeletion(
+                    name: "v1.0",
+                    deletedTarget: "abc123def456",
+                    kind: .lightweight,
+                    message: nil
+                )
+            ),
+            deleteBranchResult: GitProcessResult(
+                arguments: ["branch", "-d", "--", "feature/a"],
+                output: "Deleted branch feature/a\n",
+                exitCode: 0,
+                branchDeletion: GitBranchDeletion(name: "feature/a", deletedTarget: "abc123def456")
+            )
+        ))
+        await feature.refreshGit()
+
+        await feature.deleteTag(GitReference(
+            fullName: "refs/tags/v1.0",
+            shortName: "v1.0",
+            kind: .tag,
+            isCurrent: false,
+            upstreamShortName: nil
+        ))
+        await feature.deleteBranch(GitReference(
+            fullName: "refs/heads/feature/a",
+            shortName: "feature/a",
+            kind: .local,
+            isCurrent: false,
+            upstreamShortName: nil
+        ))
+
+        #expect(feature.recentlyDeletedTag?.name == "v1.0")
+        #expect(feature.recentlyDeletedBranch?.name == "feature/a")
+    }
+
+    @Test
+    func gitBranchRestoreReplaysRecordedNameAndTarget() async {
+        var notifications: [String] = []
+        let recorder = BranchCallRecorder()
+        let (feature, _) = makeTagTestFeature(
+            TestGitOperations(
+                snapshotValue: GitSnapshot(repositoryRoot: URL(fileURLWithPath: "/workspace"), branch: "main", changes: []),
+                createBranchResult: GitProcessResult(arguments: ["branch", "feature/short-lived", "abc123def456"], output: "", exitCode: 0),
+                deleteBranchResult: GitProcessResult(
+                    arguments: ["branch", "-d", "--", "feature/short-lived"],
+                    output: "Deleted branch feature/short-lived\n",
+                    exitCode: 0,
+                    branchDeletion: GitBranchDeletion(
+                        name: "feature/short-lived",
+                        deletedTarget: "abc123def456"
+                    )
+                ),
+                branchCallRecorder: recorder
+            ),
+            onNotify: { notifications.append($0) }
+        )
+        await feature.refreshGit()
+        let reference = GitReference(
+            fullName: "refs/heads/feature/short-lived",
+            shortName: "feature/short-lived",
+            kind: .local,
+            isCurrent: false,
+            upstreamShortName: nil
+        )
+
+        await feature.deleteBranch(reference)
+        await feature.restoreRecentlyDeletedBranch()
+
+        // The restore replays createBranch against the recorded commit without
+        // checking the branch out.
+        #expect(Array(recorder.recorded.suffix(1)) == [
+            BranchCallRecorder.Call(name: "feature/short-lived", reference: "abc123def456", checkout: false)
+        ])
+        #expect(feature.recentlyDeletedBranch == nil)
+        #expect(notifications == ["Deleted branch feature/short-lived", "Restored branch feature/short-lived"])
+
+        // Project close drops the restorable record as well.
+        feature.reset()
+        #expect(feature.recentlyDeletedBranch == nil)
+    }
+
+    @Test
+    func gitServicePreservesExecutedArgumentsAndWorkingDirectory() async {        let root = URL(fileURLWithPath: "/workspace")
         let change = GitChange(
             repositoryRoot: root,
             path: "README.md",
@@ -913,6 +1931,217 @@ struct GitModuleTests {
     }
 
     @Test
+    func worktreeInspectionPublishesHistoryBeforeStatusScanFinishes() async throws {
+        let worktree = makeTestWorktree(path: "/workspace-feature", branch: "feature/history")
+        let change = GitChange(
+            repositoryRoot: URL(fileURLWithPath: worktree.path),
+            path: "Sources/App.swift",
+            originalPath: nil,
+            indexStatus: " ",
+            workTreeStatus: "M"
+        )
+        let commit = makeTestCommit(hash: "history-commit", subject: "Show history first")
+        let snapshotGate = GitModuleTestGate()
+        let service = GitService(operations: TestGitOperations(
+            snapshotValue: GitSnapshot(
+                repositoryRoot: URL(fileURLWithPath: worktree.path),
+                branch: "feature/history",
+                changes: [change]
+            ),
+            historyValue: GitHistorySnapshot(
+                references: [],
+                recentReferences: [],
+                commits: [commit],
+                hasMore: false
+            ),
+            snapshotGate: snapshotGate
+        ))
+        let feature = GitFeatureModel(service: service)
+        let inspectionTask = Task { @MainActor in
+            await feature.inspectWorktree(worktree)
+        }
+        defer {
+            inspectionTask.cancel()
+            snapshotGate.open()
+        }
+
+        let partialInspection = await waitForGitWorktreeInspection(feature)
+        try #require(partialInspection != nil)
+        #expect(partialInspection?.commits == [commit])
+        #expect(partialInspection?.hasLoadedChanges == false)
+        #expect(partialInspection?.changes.isEmpty == true)
+
+        snapshotGate.open()
+        try #require(await waitForGitTaskCompletion(inspectionTask))
+        #expect(feature.gitWorktreeInspection?.changes == [change])
+        #expect(feature.gitWorktreeInspection?.hasLoadedChanges == true)
+    }
+
+    @Test
+    func staleWorktreeInspectionCannotClearNewLoadingState() async throws {
+        let oldWorktree = makeTestWorktree(path: "/workspace-old", branch: "feature/old")
+        let newWorktree = makeTestWorktree(path: "/workspace-new", branch: "feature/new")
+        let controller = GitHistoryLoadController(results: [
+            GitHistorySnapshot(
+                references: [],
+                recentReferences: [],
+                commits: [makeTestCommit(hash: "old-history", subject: "Old")],
+                hasMore: false
+            ),
+            GitHistorySnapshot(
+                references: [],
+                recentReferences: [],
+                commits: [makeTestCommit(hash: "new-history", subject: "New")],
+                hasMore: false
+            )
+        ])
+        let feature = GitFeatureModel(service: GitService(
+            operations: TestGitOperations(historyController: controller)
+        ))
+        let oldInspection = Task { @MainActor in
+            await feature.inspectWorktree(oldWorktree)
+        }
+        defer {
+            oldInspection.cancel()
+            controller.releaseAll()
+        }
+
+        try #require(await controller.waitUntilCallStarts(0))
+        let newInspection = Task { @MainActor in
+            await feature.inspectWorktree(newWorktree)
+        }
+        defer { newInspection.cancel() }
+        try #require(await controller.waitUntilCallStarts(1))
+        #expect(feature.gitWorktreeInspectionLoadState == .loading)
+
+        controller.releaseCall(0)
+        try #require(await waitForGitTaskCompletion(oldInspection))
+        #expect(feature.gitWorktreeInspectionLoadState == .loading)
+
+        controller.releaseCall(1)
+        try #require(await waitForGitTaskCompletion(newInspection))
+        #expect(feature.gitWorktreeInspectionLoadState == .ready)
+        #expect(feature.gitWorktreeInspection?.worktreeID == newWorktree.id)
+        #expect(!controller.didTimeOut)
+    }
+
+    @Test
+    func newerWorktreeRefreshWinsWhenAnOlderRequestFinishesLast() async throws {
+        let root = URL(fileURLWithPath: "/workspace")
+        let oldWorktree = makeTestWorktree(path: "/workspace-old", branch: "feature/old")
+        let newWorktree = makeTestWorktree(path: "/workspace-new", branch: "feature/new")
+        let loader = GitWorktreeLoadController(results: [[oldWorktree], [newWorktree]])
+        let feature = GitFeatureModel(
+            service: GitService(operations: TestGitOperations()),
+            snapshotProvider: { root in
+                GitSnapshot(repositoryRoot: root, branch: "main", changes: [])
+            },
+            worktreesProvider: { root in await loader.load(root) }
+        )
+        feature.configure(
+            workspaceURLProvider: { root },
+            isGitLogVisibleProvider: { false },
+            notify: { _ in },
+            onStateRefreshed: {}
+        )
+        await feature.refreshGit()
+
+        let firstRefresh = Task { @MainActor in await feature.refreshWorktrees() }
+        try #require(await loader.waitUntilCallStarts(0))
+        let secondRefresh = Task { @MainActor in await feature.refreshWorktrees() }
+        defer {
+            firstRefresh.cancel()
+            secondRefresh.cancel()
+            loader.releaseAll()
+        }
+        try #require(await loader.waitUntilCallStarts(1))
+        loader.releaseCall(1)
+        try #require(await waitForGitTaskCompletion(secondRefresh))
+        loader.releaseCall(0)
+        try #require(await waitForGitTaskCompletion(firstRefresh))
+
+        #expect(!loader.didTimeOut)
+        #expect(feature.gitWorktreeLoadState == .ready)
+        #expect(feature.gitWorktrees == [newWorktree])
+    }
+
+    @Test
+    func successfulWorktreeRemovalResetsItsLogScopeAndRefreshesGitState() async {
+        let root = URL(fileURLWithPath: "/workspace")
+        let removedWorktree = makeTestWorktree(path: "/workspace-maim", branch: "maim")
+        let remainingWorktree = GitWorktree(
+            path: root.path,
+            head: "2222222222222222222222222222222222222222",
+            branch: "refs/heads/preview",
+            isCurrent: true,
+            isPrimary: true,
+            isBare: false,
+            isDetached: false,
+            isLocked: false,
+            lockReason: nil,
+            isPrunable: false,
+            pruneReason: nil
+        )
+        let preview = GitReference(
+            fullName: "refs/heads/preview",
+            shortName: "preview",
+            kind: .local,
+            isCurrent: true,
+            upstreamShortName: nil
+        )
+        let maim = GitReference(
+            fullName: "refs/heads/maim",
+            shortName: "maim",
+            kind: .local,
+            isCurrent: false,
+            upstreamShortName: nil
+        )
+        let currentCommit = makeTestCommit(
+            hash: "2222222222222222",
+            subject: "Current checkout history"
+        )
+        let service = GitService(operations: TestGitOperations(
+            snapshotValue: GitSnapshot(repositoryRoot: root, branch: "preview", changes: []),
+            referencesValue: GitReferenceSnapshot(
+                references: [preview, maim],
+                recentReferences: [preview, maim]
+            ),
+            historyPageValues: [
+                "": GitHistoryPage(
+                    commits: [currentCommit],
+                    nextCursor: nil,
+                    hasMore: false
+                )
+            ],
+            removeWorktreeResult: GitProcessResult(
+                arguments: ["worktree", "remove", "--", removedWorktree.path],
+                output: "",
+                exitCode: 0
+            )
+        ))
+        let feature = GitFeatureModel(
+            service: service,
+            worktreesProvider: { _ in [remainingWorktree] }
+        )
+        feature.configure(
+            workspaceURLProvider: { root },
+            isGitLogVisibleProvider: { false },
+            notify: { _ in },
+            onStateRefreshed: {}
+        )
+        await feature.refreshGit()
+        feature.selectedGitReference = maim
+
+        await feature.removeWorktree(removedWorktree, force: false)
+
+        #expect(feature.selectedGitReference == nil)
+        #expect(!feature.isShowingAllGitReferences)
+        #expect(feature.gitWorktrees == [remainingWorktree])
+        #expect(feature.gitReferences == [preview, maim])
+        #expect(feature.gitCommits == [currentCommit])
+    }
+
+    @Test
     func gitConsolePreservesStandardErrorColorForSuccessfulCommands() {
         let entry = GitConsoleEntry(
             workingDirectory: URL(fileURLWithPath: "/workspace"),
@@ -1226,6 +2455,63 @@ private func makeTestCommit(hash: String, subject: String) -> GitCommit {
     )
 }
 
+private final class GitHistoryMutationController: @unchecked Sendable {
+    private let lock = NSLock()
+    private let before: [GitCommit]
+    private let after: [GitCommit]
+    private var didMutate = false
+    private var historyCalls = 0
+    private var revertedHashValues: [String] = []
+
+    init(before: [GitCommit], after: [GitCommit]) {
+        self.before = before
+        self.after = after
+    }
+
+    var historyCallCount: Int {
+        lock.withLock { historyCalls }
+    }
+
+    var revertedHashes: [String] {
+        lock.withLock { revertedHashValues }
+    }
+
+    func historyPage() -> GitHistoryPage {
+        lock.withLock {
+            historyCalls += 1
+            return GitHistoryPage(
+                commits: didMutate ? after : before,
+                nextCursor: nil,
+                hasMore: false
+            )
+        }
+    }
+
+    func revert(_ hash: String) -> GitProcessResult {
+        lock.withLock {
+            revertedHashValues.append(hash)
+            didMutate = true
+        }
+        return GitProcessResult(arguments: ["revert", hash], output: "", exitCode: 0)
+    }
+}
+
+private func makeTestWorktree(path: String, branch: String) -> GitWorktree {
+    GitWorktree(
+        path: path,
+        head: "1111111111111111111111111111111111111111",
+        branch: "refs/heads/\(branch)",
+        isCurrent: false,
+        isPrimary: false,
+        isBare: false,
+        isDetached: false,
+        isLocked: false,
+        lockReason: nil,
+        isPrunable: false,
+        pruneReason: nil
+    )
+}
+
 private final class GitModuleTestGate: @unchecked Sendable {
     private let condition = NSCondition()
     private var isOpen = false
@@ -1298,6 +2584,118 @@ private final class GitModuleTestGate: @unchecked Sendable {
         condition.unlock()
         timeoutTask?.cancel()
         waiter?.resume(returning: result)
+    }
+}
+
+private final class GitHistoryLoadController: @unchecked Sendable {
+    private let lock = NSLock()
+    private let results: [GitHistorySnapshot]
+    private let startedGates: [GitModuleTestGate]
+    private let releaseGates: [GitModuleTestGate]
+    private var calls = 0
+    private var timedOut = false
+
+    init(results: [GitHistorySnapshot]) {
+        self.results = results
+        startedGates = results.map { _ in GitModuleTestGate() }
+        releaseGates = results.map { _ in GitModuleTestGate() }
+    }
+
+    var didTimeOut: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return timedOut
+    }
+
+    func history(at rootURL: URL, reference: GitReference?, limit: Int) -> GitHistorySnapshot? {
+        let callIndex: Int
+        lock.lock()
+        callIndex = calls
+        calls += 1
+        lock.unlock()
+        guard results.indices.contains(callIndex) else { return nil }
+        startedGates[callIndex].open()
+        guard releaseGates[callIndex].waitSynchronously() else {
+            lock.lock()
+            timedOut = true
+            lock.unlock()
+            return nil
+        }
+        return results[callIndex]
+    }
+
+    func waitUntilCallStarts(_ index: Int) async -> Bool {
+        guard startedGates.indices.contains(index) else { return false }
+        return await startedGates[index].waitUntilOpen()
+    }
+
+    func releaseCall(_ index: Int) {
+        guard releaseGates.indices.contains(index) else { return }
+        releaseGates[index].open()
+    }
+
+    func releaseAll() {
+        releaseGates.forEach { $0.open() }
+    }
+}
+
+private final class GitWorktreeLoadController: @unchecked Sendable {
+    private let lock = NSLock()
+    private let results: [[GitWorktree]?]
+    private let startedGates: [GitModuleTestGate]
+    private let releaseGates: [GitModuleTestGate]
+    private var calls = 0
+    private var timedOut = false
+
+    init(results: [[GitWorktree]?]) {
+        self.results = results
+        startedGates = results.map { _ in GitModuleTestGate() }
+        releaseGates = results.map { _ in GitModuleTestGate() }
+    }
+
+    var didTimeOut: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return timedOut
+    }
+
+    func load(_ root: URL) async -> [GitWorktree]? {
+        let callIndex = reserveCall()
+        guard results.indices.contains(callIndex) else { return nil }
+        startedGates[callIndex].open()
+        guard await releaseGates[callIndex].waitUntilOpen() else {
+            recordTimeout()
+            return nil
+        }
+        return results[callIndex]
+    }
+
+    func waitUntilCallStarts(_ index: Int) async -> Bool {
+        guard startedGates.indices.contains(index) else { return false }
+        return await startedGates[index].waitUntilOpen()
+    }
+
+    func releaseCall(_ index: Int) {
+        guard releaseGates.indices.contains(index) else { return }
+        releaseGates[index].open()
+    }
+
+    func releaseAll() {
+        releaseGates.forEach { $0.open() }
+    }
+
+    private func reserveCall() -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        let callIndex = calls
+        calls += 1
+        return callIndex
+    }
+
+    private func recordTimeout() {
+        lock.lock()
+        timedOut = true
+        lock.unlock()
     }
 }
 
@@ -1444,6 +2842,19 @@ private func waitForGitTaskCompletion(
 }
 
 @MainActor
+private func waitForGitWorktreeInspection(
+    _ feature: GitFeatureModel,
+    timeout: Duration = .seconds(2)
+) async -> GitWorktreeInspection? {
+    let clock = ContinuousClock()
+    let deadline = clock.now.advanced(by: timeout)
+    while feature.gitWorktreeInspection == nil, clock.now < deadline {
+        await Task.yield()
+    }
+    return feature.gitWorktreeInspection
+}
+
+@MainActor
 private func waitForGitWorkToBecomeIdle(
     timeout: Duration = .seconds(2),
     isActive: @MainActor () -> Bool
@@ -1456,8 +2867,144 @@ private func waitForGitWorkToBecomeIdle(
     return !isActive()
 }
 
+private final class GitPerformanceLogRecorder: GitPerformanceLogger, @unchecked Sendable {
+    private let lock = NSLock()
+    private var recordedMessages: [String] = []
+
+    var messages: [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return recordedMessages
+    }
+
+    func record(_ message: String) {
+        lock.lock()
+        recordedMessages.append(message)
+        lock.unlock()
+    }
+}
+
+/// Records tag create/delete arguments so restore flows can be asserted on
+/// the exact parameters the feature model replays.
+private final class TagCallRecorder: @unchecked Sendable {
+    struct Call: Equatable {
+        let name: String
+        let revision: String
+        let message: String?
+    }
+
+    private let lock = NSLock()
+    private var calls: [Call] = []
+
+    func record(_ call: Call) {
+        lock.lock()
+        calls.append(call)
+        lock.unlock()
+    }
+
+    var recorded: [Call] {
+        lock.lock()
+        defer { lock.unlock() }
+        return calls
+    }
+}
+
+/// Records branch create/delete arguments for the branch restore flow.
+private final class BranchCallRecorder: @unchecked Sendable {
+    struct Call: Equatable {
+        let name: String
+        let reference: String
+        let checkout: Bool
+    }
+
+    private let lock = NSLock()
+    private var calls: [Call] = []
+
+    func record(_ call: Call) {
+        lock.lock()
+        calls.append(call)
+        lock.unlock()
+    }
+
+    var recorded: [Call] {
+        lock.lock()
+        defer { lock.unlock() }
+        return calls
+    }
+}
+
+/// Supplies deterministic per-call results for consecutive Git mutations.
+private final class GitProcessResultQueue: @unchecked Sendable {
+    private let lock = NSLock()
+    private var results: [GitProcessResult]
+
+    init(_ results: [GitProcessResult]) {
+        self.results = results
+    }
+
+    func next() -> GitProcessResult? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !results.isEmpty else { return nil }
+        return results.removeFirst()
+    }
+}
+
+/// Controls the native synchronous operation boundary on GitService's worker
+/// queue. The existing gate bounds failures and exposes an async start event.
+private final class GitGraphHistoryProbe: @unchecked Sendable {
+    let started = GitModuleTestGate()
+    let release = GitModuleTestGate()
+    private let lock = NSLock()
+    private let blockGraph: Bool
+    private let releaseOnCancel: Bool
+    private var graphRequests = 0
+    private var failed = false
+    private var closed: [String] = []
+    private var cancelled: [String] = []
+    private var graphOperationID: String?
+    private var allReferences = false
+    private var timedOut = false
+
+    init(blockGraph: Bool = false, releaseOnCancel: Bool = true) {
+        self.blockGraph = blockGraph
+        self.releaseOnCancel = releaseOnCancel
+    }
+    var closedCursors: [String] { lock.withLock { closed } }
+    var requestedAllReferences: Bool { lock.withLock { allReferences } }
+    var didTimeOut: Bool { lock.withLock { timedOut } }
+    var graphWasCancelled: Bool { lock.withLock { graphOperationID.map(cancelled.contains) ?? false } }
+    func failGraphRequest() { lock.withLock { failed = true } }
+    func close(cursor: String) { lock.withLock { closed.append(cursor) } }
+    func cancel(operationID: String) {
+        lock.withLock { cancelled.append(operationID) }
+        if releaseOnCancel { release.open() }
+    }
+
+    func page(reference: GitReference?, cursor: String?, limit: Int, operationID: String) -> GitHistoryPage? {
+        if limit == 5_000 {
+            let shouldBlock = lock.withLock {
+                graphOperationID = operationID
+                allReferences = reference == nil && cursor == nil
+                graphRequests += 1
+                return blockGraph && graphRequests == 1
+            }
+            started.open()
+            if shouldBlock, !release.waitSynchronously() { lock.withLock { timedOut = true } }
+            guard !lock.withLock({ failed }) else { return nil }
+            return GitHistoryPage(commits: [makeTestCommit(hash: "other-branch", subject: "Other branch"),
+                                           makeTestCommit(hash: "visible", subject: "Visible")],
+                                  nextCursor: "graph-cursor", hasMore: true)
+        }
+        return GitHistoryPage(commits: [makeTestCommit(hash: cursor == nil ? "visible" : "older", subject: "Visible history")],
+                              nextCursor: cursor == nil ? "visible-cursor" : nil, hasMore: cursor == nil)
+    }
+}
+
 private struct TestGitOperations: GitOperations {
     private let snapshotValue: GitSnapshot?
+    private let snapshotsByRoot: [String: GitSnapshot]
+    private let repositoryRoots: [URL]?
     private let comparisonValue: GitBranchComparison?
     private let typedComparisonValue: GitBranchComparison?
     private let filesValue: [GitCommitFile]?
@@ -1465,37 +3012,105 @@ private struct TestGitOperations: GitOperations {
     private let comparisonDiffDocumentValue: DiffDocument?
     private let typedComparisonDiffDocumentValue: DiffDocument?
     private let historyValue: GitHistorySnapshot?
+    private let referencesValue: GitReferenceSnapshot?
+    private let historyPageValues: [String: GitHistoryPage]?
+    private let historyPageHandler: (@Sendable () -> GitHistoryPage?)?
+    private let graphHistoryProbe: GitGraphHistoryProbe?
+    private let historyController: GitHistoryLoadController?
+    private let snapshotGate: GitModuleTestGate?
+    private let discardHandler: (@Sendable (GitChange) -> GitProcessResult?)?
+    private let applyPatchHandler: (@Sendable (String, URL, String) -> GitProcessResult?)?
     private let stageResult: GitProcessResult?
+    private let commitResult: GitProcessResult?
+    private let revertHandler: (@Sendable (String) -> GitProcessResult?)?
     private let runGate: TestGitRunGate?
     private let filesRecorder: GitFilesCallRecorder?
     private let filesGate: GitFilesLoadGate?
+    private let createTagResult: GitProcessResult?
+    private let deleteTagResult: GitProcessResult?
+    private let deleteTagResults: GitProcessResultQueue?
+    private let tagCallRecorder: TagCallRecorder?
+    private let createBranchResult: GitProcessResult?
+    private let deleteBranchResult: GitProcessResult?
+    private let deleteBranchResults: GitProcessResultQueue?
+    private let branchCallRecorder: BranchCallRecorder?
+    private let exportPatchHandler: (@Sendable ([String], Bool) -> Result<GitPatchExport, GitPatchFailure>)?
+    private let removeWorktreeResult: GitProcessResult?
 
     init(
         snapshotValue: GitSnapshot? = nil,
+        snapshotsByRoot: [String: GitSnapshot] = [:],
+        repositoryRoots: [URL]? = nil,
         comparisonValue: GitBranchComparison? = nil,
         typedComparisonValue: GitBranchComparison? = nil,
         historyValue: GitHistorySnapshot? = nil,
+        referencesValue: GitReferenceSnapshot? = nil,
+        historyPageValues: [String: GitHistoryPage]? = nil,
+        historyPageHandler: (@Sendable () -> GitHistoryPage?)? = nil,
+        graphHistoryProbe: GitGraphHistoryProbe? = nil,
+        historyController: GitHistoryLoadController? = nil,
         filesValue: [GitCommitFile]? = nil,
         untrackedDiffDocumentValue: DiffDocument? = nil,
         comparisonDiffDocumentValue: DiffDocument? = nil,
         typedComparisonDiffDocumentValue: DiffDocument? = nil,
+        snapshotGate: GitModuleTestGate? = nil,
+        discardHandler: (@Sendable (GitChange) -> GitProcessResult?)? = nil,
+        applyPatchHandler: (@Sendable (String, URL, String) -> GitProcessResult?)? = nil,
         stageResult: GitProcessResult? = nil,
+        commitResult: GitProcessResult? = nil,
+        revertHandler: (@Sendable (String) -> GitProcessResult?)? = nil,
         runGate: TestGitRunGate? = nil,
         filesRecorder: GitFilesCallRecorder? = nil,
-        filesGate: GitFilesLoadGate? = nil
+        filesGate: GitFilesLoadGate? = nil,
+        createTagResult: GitProcessResult? = nil,
+        deleteTagResult: GitProcessResult? = nil,
+        deleteTagResults: GitProcessResultQueue? = nil,
+        tagCallRecorder: TagCallRecorder? = nil,
+        createBranchResult: GitProcessResult? = nil,
+        deleteBranchResult: GitProcessResult? = nil,
+        deleteBranchResults: GitProcessResultQueue? = nil,
+        branchCallRecorder: BranchCallRecorder? = nil,
+        exportPatchHandler: (@Sendable ([String], Bool) -> Result<GitPatchExport, GitPatchFailure>)? = nil,
+        removeWorktreeResult: GitProcessResult? = nil
     ) {
         self.snapshotValue = snapshotValue
+        self.snapshotsByRoot = snapshotsByRoot
+        self.repositoryRoots = repositoryRoots
         self.comparisonValue = comparisonValue
         self.typedComparisonValue = typedComparisonValue
         self.historyValue = historyValue
+        self.referencesValue = referencesValue
+        self.historyPageValues = historyPageValues
+        self.historyPageHandler = historyPageHandler
+        self.graphHistoryProbe = graphHistoryProbe
+        self.historyController = historyController
         self.filesValue = filesValue
         self.untrackedDiffDocumentValue = untrackedDiffDocumentValue
         self.comparisonDiffDocumentValue = comparisonDiffDocumentValue
         self.typedComparisonDiffDocumentValue = typedComparisonDiffDocumentValue
+        self.snapshotGate = snapshotGate
+        self.discardHandler = discardHandler
+        self.applyPatchHandler = applyPatchHandler
         self.stageResult = stageResult
+        self.commitResult = commitResult
+        self.revertHandler = revertHandler
         self.runGate = runGate
         self.filesRecorder = filesRecorder
         self.filesGate = filesGate
+        self.createTagResult = createTagResult
+        self.deleteTagResult = deleteTagResult
+        self.deleteTagResults = deleteTagResults
+        self.tagCallRecorder = tagCallRecorder
+        self.createBranchResult = createBranchResult
+        self.deleteBranchResult = deleteBranchResult
+        self.deleteBranchResults = deleteBranchResults
+        self.branchCallRecorder = branchCallRecorder
+        self.exportPatchHandler = exportPatchHandler
+        self.removeWorktreeResult = removeWorktreeResult
+    }
+
+    func exportPatch(at rootURL: URL, source: GitPatchSource, paths: [String], base: String?, target: String?, metadataOnly: Bool) -> Result<GitPatchExport, GitPatchFailure> {
+        exportPatchHandler?(paths, metadataOnly) ?? .failure(GitPatchFailure("Patch export unavailable"))
     }
 
     func run(arguments: [String], workingDirectory: String, input: String?) -> GitProcessResult {
@@ -1509,8 +3124,18 @@ private struct TestGitOperations: GitOperations {
         )
     }
 
-    func snapshot(at rootURL: URL) -> GitSnapshot? { snapshotValue }
+    func snapshot(at rootURL: URL) -> GitSnapshot? {
+        _ = snapshotGate?.waitSynchronously()
+        if let snapshot = snapshotsByRoot[rootURL.standardizedFileURL.path] {
+            return snapshot
+        }
+        return snapshotValue
+    }
+    func repositories(in workspaceURL: URL) -> [URL] {
+        repositoryRoots ?? (snapshot(at: workspaceURL).map { [$0.repositoryRoot] } ?? [])
+    }
     func watchContext(at rootURL: URL) -> GitWatchContext? { nil }
+    func worktrees(at rootURL: URL) -> [GitWorktree]? { nil }
     func diffDocument(at rootURL: URL, pathspecs: [String], staged: Bool, untracked: Bool, whitespace: GitDiffWhitespaceMode) -> DiffDocument? {
         untracked ? untrackedDiffDocumentValue : nil
     }
@@ -1518,8 +3143,54 @@ private struct TestGitOperations: GitOperations {
     func commitDiffDocument(at rootURL: URL, commit: String, pathspecs: [String], whitespace: GitDiffWhitespaceMode) -> DiffDocument? { nil }
     func comparisonDiffDocument(at rootURL: URL, reference: String, pathspecs: [String], whitespace: GitDiffWhitespaceMode) -> DiffDocument? { comparisonDiffDocumentValue }
     func comparisonDiffDocument(at rootURL: URL, reference: GitReference, targetReference: GitReference?, pathspecs: [String], whitespace: GitDiffWhitespaceMode) -> DiffDocument? { typedComparisonDiffDocumentValue }
-    func applyPatch(_ patch: String, at rootURL: URL, mode: String) -> GitProcessResult? { nil }
-    func history(at rootURL: URL, reference: GitReference?, limit: Int) -> GitHistorySnapshot? { historyValue }
+    func applyPatch(_ patch: String, at rootURL: URL, mode: String) -> GitProcessResult? {
+        applyPatchHandler?(patch, rootURL, mode)
+    }
+    func history(at rootURL: URL, reference: GitReference?, limit: Int) -> GitHistorySnapshot? {
+        if let historyController {
+            return historyController.history(at: rootURL, reference: reference, limit: limit)
+        }
+        return historyValue
+    }
+    func references(at rootURL: URL, operationID: String) -> GitReferenceSnapshot? {
+        if let referencesValue { return referencesValue }
+        guard let historyValue else { return nil }
+        return GitReferenceSnapshot(
+            references: historyValue.references,
+            recentReferences: historyValue.recentReferences,
+            identity: historyValue.identity
+        )
+    }
+    func historyPage(
+        at rootURL: URL,
+        reference: GitReference?,
+        cursor: String?,
+        limit: Int,
+        operationID: String
+    ) -> GitHistoryPage? {
+        if let graphHistoryProbe {
+            return graphHistoryProbe.page(reference: reference, cursor: cursor, limit: limit, operationID: operationID)
+        }
+        if let historyPageHandler { return historyPageHandler() }
+        if let historyPageValues { return historyPageValues[cursor ?? ""] }
+        guard let historyValue else { return nil }
+        let offset = cursor.flatMap(Int.init) ?? 0
+        let commits = Array(historyValue.commits.dropFirst(offset).prefix(limit))
+        let hasMore = historyValue.commits.count > offset + commits.count || historyValue.hasMore
+        return GitHistoryPage(
+            commits: commits,
+            nextCursor: hasMore ? String(offset + commits.count) : nil,
+            hasMore: hasMore
+        )
+    }
+    func closeHistoryCursor(at rootURL: URL, cursor: String) -> Bool {
+        graphHistoryProbe?.close(cursor: cursor)
+        return graphHistoryProbe != nil
+    }
+    func cancel(operationID: String) -> Bool {
+        graphHistoryProbe?.cancel(operationID: operationID)
+        return graphHistoryProbe != nil
+    }
     func files(in commit: GitCommit, at rootURL: URL) -> [GitCommitFile]? {
         filesRecorder?.recordCall()
         if let filesGate {
@@ -1534,15 +3205,29 @@ private struct TestGitOperations: GitOperations {
     func blame(at rootURL: URL, relativePath: String) -> [GitBlameLine]? { nil }
     func stage(_ change: GitChange) -> GitProcessResult? { stageResult }
     func unstage(_ change: GitChange) -> GitProcessResult? { nil }
-    func discard(_ change: GitChange) -> GitProcessResult? { nil }
+    func discard(_ change: GitChange) -> GitProcessResult? { discardHandler?(change) }
     func discardAll(_ change: GitChange) -> GitProcessResult? { nil }
-    func commit(at rootURL: URL, message: String, amend: Bool) -> GitProcessResult? { nil }
+    func commit(at rootURL: URL, message: String, amend: Bool) -> GitProcessResult? { commitResult }
     func cherryPick(_ hash: String, at rootURL: URL) -> GitProcessResult? { nil }
-    func revert(_ hash: String, at rootURL: URL) -> GitProcessResult? { nil }
+    func revert(_ hash: String, at rootURL: URL) -> GitProcessResult? { revertHandler?(hash) }
     func resetCurrentBranch(to hash: String, mode: String, at rootURL: URL) -> GitProcessResult? { nil }
-    func createBranch(named name: String, from reference: GitReference, checkout: Bool, at rootURL: URL) -> GitProcessResult? { nil }
+    func createBranch(named name: String, from reference: GitReference, checkout: Bool, at rootURL: URL) -> GitProcessResult? {
+        branchCallRecorder?.record(BranchCallRecorder.Call(name: name, reference: reference.fullName, checkout: checkout))
+        return createBranchResult
+    }
+    func createWorktree(named name: String, from reference: GitReference, revision: String?, at destination: URL, repositoryRoot: URL) -> GitProcessResult? { nil }
+    func removeWorktree(_ worktree: GitWorktree, force: Bool, at rootURL: URL) -> GitProcessResult? {
+        removeWorktreeResult
+    }
+    func lockWorktree(_ worktree: GitWorktree, at rootURL: URL) -> GitProcessResult? { nil }
+    func unlockWorktree(_ worktree: GitWorktree, at rootURL: URL) -> GitProcessResult? { nil }
+    func repairWorktrees(at rootURL: URL) -> GitProcessResult? { nil }
+    func pruneWorktrees(at rootURL: URL) -> GitProcessResult? { nil }
     func renameBranch(_ reference: GitReference, to name: String, at rootURL: URL) -> GitProcessResult? { nil }
-    func deleteBranch(_ reference: GitReference, at rootURL: URL) -> GitProcessResult? { nil }
+    func deleteBranch(_ reference: GitReference, at rootURL: URL) -> GitProcessResult? {
+        branchCallRecorder?.record(BranchCallRecorder.Call(name: reference.shortName, reference: reference.fullName, checkout: false))
+        return deleteBranchResults?.next() ?? deleteBranchResult
+    }
     func mergeBranch(_ reference: GitReference, at rootURL: URL) -> GitProcessResult? { nil }
     func rebaseCurrentBranch(onto reference: GitReference, at rootURL: URL) -> GitProcessResult? { nil }
     func checkoutAndRebase(_ reference: GitReference, at rootURL: URL) -> GitProcessResult? {
@@ -1582,4 +3267,12 @@ private struct TestGitOperations: GitOperations {
     func popStash(_ stash: GitStash, at rootURL: URL) -> GitProcessResult? { nil }
     func dropStash(_ stash: GitStash, at rootURL: URL) -> GitProcessResult? { nil }
     func stageAll(at rootURL: URL) -> GitProcessResult? { nil }
+    func createTag(named name: String, at revision: String, message: String?, rootURL: URL) -> GitProcessResult? {
+        tagCallRecorder?.record(TagCallRecorder.Call(name: name, revision: revision, message: message))
+        return createTagResult
+    }
+    func deleteTag(named name: String, rootURL: URL) -> GitProcessResult? {
+        tagCallRecorder?.record(TagCallRecorder.Call(name: name, revision: "", message: nil))
+        return deleteTagResults?.next() ?? deleteTagResult
+    }
 }

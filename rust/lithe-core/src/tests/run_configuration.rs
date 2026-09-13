@@ -7,6 +7,75 @@ use std::fs;
 use std::path::PathBuf;
 
 #[test]
+fn resolved_maven_ownership_survives_cwd_override_and_separates_reactors() {
+    let fixture: Value = serde_json::from_str(include_str!(
+        "../../../../shared/fixtures/run-configuration/maven-module-ownership.json"
+    ))
+    .unwrap();
+    let root = temporary_root("maven-menu-ownership");
+    // The guard also removes generated documents when an assertion fails.
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.0).expect("remove fixture workspace");
+        }
+    }
+    let _cleanup = Cleanup(root.clone());
+    for (path, contents) in fixture["files"].as_object().unwrap() {
+        let path = root.join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, contents.as_str().unwrap()).unwrap();
+    }
+    let generated: Value = serde_json::from_str(&execute_json(
+        &serde_json::json!({
+            "id": "generate", "command": "runConfig.generate",
+            "payload": {"root": root, "paths": fixture["paths"], "modulePaths": []}
+        })
+        .to_string(),
+    ))
+    .unwrap();
+    assert_eq!(generated["ok"], true, "{generated}");
+    fs::create_dir_all(root.join(".lithe/run")).unwrap();
+    fs::write(
+        root.join(".lithe/run/generated.json"),
+        generated["data"]["generated"].to_string(),
+    )
+    .unwrap();
+    let resolved: Value = serde_json::from_str(&execute_json(
+        &serde_json::json!({
+            "id": "resolve", "command": "runConfig.resolve",
+            "payload": {"root": root, "localDocument": fixture["local"]}
+        })
+        .to_string(),
+    ))
+    .unwrap();
+    assert_eq!(resolved["ok"], true, "{resolved}");
+    let configurations = resolved["data"]["configurations"].as_array().unwrap();
+    for expected in fixture["expected"]["configurations"].as_array().unwrap() {
+        let actual = configurations
+            .iter()
+            .find(|item| item["id"] == expected["id"])
+            .unwrap();
+        for key in ["id", "name", "provider", "execution", "cwd"] {
+            assert_eq!(actual[key], expected[key], "{key}: {actual}");
+        }
+        assert_eq!(actual["debug"], expected["debug"]);
+        if actual["provider"] == "java.current-file" {
+            assert!(actual["extensions"]["maven"]["reactorPath"].is_null());
+        } else {
+            assert_eq!(actual["disabled"], false);
+            assert_eq!(actual["toolchains"], expected["toolchains"]);
+            for key in ["module", "reactorPath"] {
+                assert_eq!(
+                    actual["extensions"]["maven"][key],
+                    expected["extensions"]["maven"][key]
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn run_configuration_commands_generate_merge_and_plan() {
     let root = temporary_root("run-config");
     fs::create_dir_all(root.join("src/main/java/com/example"))
@@ -46,6 +115,13 @@ fn run_configuration_commands_generate_merge_and_plan() {
     assert_eq!(current["name"], "Local File");
     assert_eq!(current["toolchains"]["java"], "custom-jdk");
     assert_eq!(current["toolchains"]["maven"], "custom-maven");
+    let service = resolve["data"]["configurations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|value| value["id"] == "spring-boot.maven:demo")
+        .unwrap();
+    assert_eq!(service["extensions"]["maven"]["reactorPath"], ".");
     let plan: Value = serde_json::from_str(&execute_json(&serde_json::json!({"id":"plan","command":"runConfig.createLaunchPlan","payload":{"root":root,"configurationId":"current-file","currentFile":"src/main/java/com/example/App.java"}}).to_string())).unwrap();
     assert_eq!(plan["ok"], true);
     assert_eq!(plan["data"]["executable"]["toolchain"], "custom-jdk");
@@ -206,8 +282,12 @@ fn run_configuration_generation_uses_a_maven_project_below_the_workspace() {
         "./mvnw"
     );
     assert_eq!(
-        response["data"]["toolchainRequirements"]["toolchains"]["project-maven"]["version"],
+        response["data"]["toolchainRequirements"]["toolchains"]["project-maven"]["minimumVersion"],
         "3.9.9"
+    );
+    assert!(
+        response["data"]["toolchainRequirements"]["toolchains"]["project-maven"]["version"]
+            .is_null()
     );
 
     fs::create_dir_all(root.join(".lithe/run")).unwrap();
@@ -240,7 +320,7 @@ fn run_configuration_generation_uses_a_maven_project_below_the_workspace() {
     assert_eq!(plan["ok"], true, "{plan}");
     assert_eq!(plan["data"]["workingDirectory"], "projects/demo");
     assert_eq!(
-        &plan["data"]["arguments"].as_array().unwrap()[..11],
+        &plan["data"]["arguments"].as_array().unwrap()[..12],
         [
             "-B",
             "-ntp",
@@ -250,12 +330,13 @@ fn run_configuration_generation_uses_a_maven_project_below_the_workspace() {
             "/local/settings.xml",
             "-pl",
             "service",
+            "-am",
             "-DskipTests",
             "-Dspring-boot.run.main-class=com.example.App",
             "spring-boot:run"
         ]
     );
-    assert!(!plan["data"]["arguments"]
+    assert!(plan["data"]["arguments"]
         .as_array()
         .unwrap()
         .iter()
@@ -306,7 +387,7 @@ fn run_configuration_generation_uses_a_maven_project_below_the_workspace() {
         .as_array()
         .unwrap()
         .iter()
-        .any(|argument| argument == "-am" || argument == "-DskipTests"));
+        .any(|argument| argument == "-DskipTests"));
 
     let java_plan: Value = serde_json::from_str(&execute_json(
         &serde_json::json!({
@@ -1575,8 +1656,12 @@ fn run_configuration_generation_detects_declared_toolchain_versions() {
         "temurin"
     );
     assert_eq!(
-        generated["data"]["toolchainRequirements"]["toolchains"]["project-maven"]["version"],
+        generated["data"]["toolchainRequirements"]["toolchains"]["project-maven"]["minimumVersion"],
         "3.9.9"
+    );
+    assert!(
+        generated["data"]["toolchainRequirements"]["toolchains"]["project-maven"]["version"]
+            .is_null()
     );
 
     fs::remove_dir_all(root).unwrap();
@@ -1742,6 +1827,67 @@ fn run_configuration_inspection_summarizes_changed_inputs() {
     assert_eq!(
         inspected["data"]["diagnostics"][0]["message"],
         "Project inputs changed: 0 added, 0 removed, 1 modified"
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn maven_wrapper_version_accepts_newer_system_maven() {
+    let root = temporary_root("run-config-maven-wrapper-minimum");
+    fs::create_dir_all(root.join(".lithe/run")).unwrap();
+    fs::create_dir_all(root.join(".lithe/toolchains")).unwrap();
+    fs::write(
+        root.join(".lithe/run/generated.json"),
+        r#"{"version":1,"configurations":[{"id":"spring","name":"Spring","type":"spring-boot.maven","toolchains":{"java":"project-jdk","maven":"project-maven"}}]}"#,
+    )
+    .unwrap();
+    // Legacy documents stored the wrapper distribution under `version`.
+    // That value is a floor for system Maven, not an exact pin.
+    fs::write(
+        root.join(".lithe/toolchains/requirements.json"),
+        r#"{"version":1,"toolchains":{"project-maven":{"type":"maven","version":"3.6.3","java":"project-jdk"}}}"#,
+    )
+    .unwrap();
+
+    let resolve = |version: &str| -> Value {
+        serde_json::from_str(&execute_json(
+            &serde_json::json!({
+                "id": "resolve-maven",
+                "command": "runConfig.resolve",
+                "payload": {
+                    "root": root,
+                    "toolchainCandidates": [{
+                        "id": "project-maven",
+                        "type": "maven",
+                        "version": version,
+                        "vendor": ""
+                    }]
+                }
+            })
+            .to_string(),
+        ))
+        .unwrap()
+    };
+
+    let newer = resolve("3.9.16");
+    assert!(
+        newer["data"]["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|value| value["code"] != "toolchainVersionMismatch"),
+        "{newer}"
+    );
+
+    let older = resolve("3.5.4");
+    assert!(
+        older["data"]["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value["code"] == "toolchainVersionMismatch"),
+        "{older}"
     );
 
     fs::remove_dir_all(root).unwrap();
@@ -2274,6 +2420,7 @@ fn migrated_v1_documents_produce_identical_launch_arguments() {
             "-ntp",
             "-pl",
             "backend",
+            "-am",
             "-P",
             "local",
             "-Dspring-boot.run.main-class=com.example.App",

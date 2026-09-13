@@ -1,4 +1,5 @@
 import AppKit
+import os
 import SwiftUI
 
 enum LitheSplitAxis {
@@ -9,7 +10,8 @@ enum LitheSplitAxis {
 struct SplitHandleView: View {
     // Keep the hit target wider than the visible divider so resizing does not
     // depend on landing on a single pixel row or column.
-    static let thickness: CGFloat = 10
+    static let thickness: CGFloat = 5
+    static let hitThickness: CGFloat = 10
 
     let axis: LitheSplitAxis
     let leadingBackground: Color
@@ -21,6 +23,8 @@ struct SplitHandleView: View {
 
     @State private var isHovering = false
     @State private var isDragging = false
+    @State private var dragScheduler = LitheDragUpdateScheduler()
+    @State private var dragSignpost: LitheSignpost.State?
 
     init(
         axis: LitheSplitAxis,
@@ -40,39 +44,68 @@ struct SplitHandleView: View {
         self.onDragEnded = onDragEnded
     }
 
-    @ViewBuilder
     var body: some View {
-        if axis == .horizontal {
-            handleSurface.frame(maxHeight: .infinity)
-        } else {
-            handleSurface.frame(maxWidth: .infinity)
-        }
-    }
-
-    private var handleSurface: some View {
         ZStack {
             trackBackground
+            Color.clear
             dividerLine
-            SplitHandleInteractionView(
-                axis: axis,
-                onHoverChanged: { isHovering = $0 },
-                onDragStateChanged: { isDragging = $0 },
-                onDragStarted: onDragStarted,
-                onDragChanged: onDragChanged,
-                onDragEnded: onDragEnded
-            )
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
+        .frame(
+            width: axis == .horizontal ? Self.hitThickness : nil,
+            height: axis == .vertical ? Self.hitThickness : nil
+        )
+        .frame(
+            maxWidth: axis == .vertical ? .infinity : nil,
+            maxHeight: axis == .horizontal ? .infinity : nil
+        )
+        .overlay {
+            SplitHandleInteraction(
+                axis: axis,
+                onHoverChanged: { isInside in
+                    guard isInside != isHovering else { return }
+                    isHovering = isInside
+                },
+                onDragStarted: {
+                    isDragging = true
+                    dragSignpost = LitheSignpost.begin("split.drag")
+                    onDragStarted()
+                },
+                onDragChanged: { currentTranslation in
+                    // Keep geometry changes coalesced and local to the split container.
+                    dragScheduler.submit(currentTranslation) { translation in
+                        var transaction = Transaction()
+                        transaction.animation = nil
+                        withTransaction(transaction) {
+                            onDragChanged(translation)
+                        }
+                    }
+                },
+                onDragEnded: { finalTranslation in
+                    dragScheduler.cancel()
+                    isDragging = false
+                    if let dragSignpost {
+                        LitheSignpost.end("split.drag", dragSignpost)
+                        self.dragSignpost = nil
+                    }
+                    onDragEnded(finalTranslation)
+                }
+            )
+        }
+        .onDisappear {
+            dragScheduler.cancel()
+            if let dragSignpost {
+                LitheSignpost.end("split.drag", dragSignpost)
+                self.dragSignpost = nil
+            }
+        }
+        // Reserve a compact gap while the centered hit surface extends into both panes.
         .frame(
             width: axis == .horizontal ? Self.thickness : nil,
             height: axis == .vertical ? Self.thickness : nil
         )
-        .contentShape(Rectangle())
-        .onDisappear {
-            isHovering = false
-            isDragging = false
-        }
+        .zIndex(1)
         .help(axis == .horizontal ? "Drag left or right to resize" : "Drag up or down to resize")
+        .accessibilityElement(children: .ignore)
         .accessibilityLabel(axis == .horizontal ? "Horizontal pane resize handle" : "Vertical pane resize handle")
     }
 
@@ -117,181 +150,108 @@ struct SplitHandleView: View {
 
 }
 
-private struct SplitHandleInteractionView: NSViewRepresentable {
+private struct SplitHandleInteraction: NSViewRepresentable {
     let axis: LitheSplitAxis
     let onHoverChanged: (Bool) -> Void
-    let onDragStateChanged: (Bool) -> Void
     let onDragStarted: () -> Void
     let onDragChanged: (CGFloat) -> Void
     let onDragEnded: (CGFloat) -> Void
 
-    func makeNSView(context: Context) -> SplitHandleInteractionNSView {
-        SplitHandleInteractionNSView(
-            axis: axis,
-            onHoverChanged: onHoverChanged,
-            onDragStateChanged: onDragStateChanged,
-            onDragStarted: onDragStarted,
-            onDragChanged: onDragChanged,
-            onDragEnded: onDragEnded
-        )
+    func makeNSView(context: Context) -> SplitHandleInteractionView {
+        let view = SplitHandleInteractionView()
+        updateNSView(view, context: context)
+        return view
     }
 
-    func updateNSView(_ nsView: SplitHandleInteractionNSView, context: Context) {
-        nsView.update(
-            axis: axis,
-            onHoverChanged: onHoverChanged,
-            onDragStateChanged: onDragStateChanged,
-            onDragStarted: onDragStarted,
-            onDragChanged: onDragChanged,
-            onDragEnded: onDragEnded
-        )
-    }
-
-    static func dismantleNSView(_ nsView: SplitHandleInteractionNSView, coordinator: ()) {
-        nsView.cancelInteraction()
+    func updateNSView(_ view: SplitHandleInteractionView, context: Context) {
+        view.axis = axis
+        view.onHoverChanged = onHoverChanged
+        view.onDragStarted = onDragStarted
+        view.onDragChanged = onDragChanged
+        view.onDragEnded = onDragEnded
     }
 }
 
-private final class SplitHandleInteractionNSView: NSView {
-    private var axis: LitheSplitAxis
-    private var onHoverChanged: (Bool) -> Void
-    private var onDragStateChanged: (Bool) -> Void
-    private var onDragStarted: () -> Void
-    private var onDragChanged: (CGFloat) -> Void
-    private var onDragEnded: (CGFloat) -> Void
-    private var trackingArea: NSTrackingArea?
-    private var dragStartInWindow: NSPoint?
-    private var isDragging = false
-    private var isInside = false
-
-    init(
-        axis: LitheSplitAxis,
-        onHoverChanged: @escaping (Bool) -> Void,
-        onDragStateChanged: @escaping (Bool) -> Void,
-        onDragStarted: @escaping () -> Void,
-        onDragChanged: @escaping (CGFloat) -> Void,
-        onDragEnded: @escaping (CGFloat) -> Void
-    ) {
-        self.axis = axis
-        self.onHoverChanged = onHoverChanged
-        self.onDragStateChanged = onDragStateChanged
-        self.onDragStarted = onDragStarted
-        self.onDragChanged = onDragChanged
-        self.onDragEnded = onDragEnded
-        super.init(frame: .zero)
-        wantsLayer = true
-        layer?.backgroundColor = NSColor.clear.cgColor
-    }
-
-    required init?(coder: NSCoder) {
-        fatalError("init(coder:) has not been implemented")
-    }
-
-    override func updateTrackingAreas() {
-        if let trackingArea {
-            removeTrackingArea(trackingArea)
+/// The native hit target owns both cursor tracking and drag delivery. A cursor
+/// background that returns nil from hitTest leaves NSHostingView in charge of
+/// the pointer and lets it overwrite the resize cursor after native editor exit.
+final class SplitHandleInteractionView: NSView {
+    var axis: LitheSplitAxis = .horizontal {
+        didSet {
+            guard axis != oldValue else { return }
+            window?.invalidateCursorRects(for: self)
         }
-        let area = NSTrackingArea(
-            rect: bounds,
-            options: [.mouseEnteredAndExited, .cursorUpdate, .activeInKeyWindow, .inVisibleRect],
-            owner: self,
-            userInfo: nil
-        )
-        addTrackingArea(area)
-        trackingArea = area
-        super.updateTrackingAreas()
     }
+    var onHoverChanged: ((Bool) -> Void)?
+    var onDragStarted: (() -> Void)?
+    var onDragChanged: ((CGFloat) -> Void)?
+    var onDragEnded: ((CGFloat) -> Void)?
+    private var tracking: NSTrackingArea?
+    private var dragStartPoint: NSPoint?
+
+    var resizeCursor: NSCursor { axis == .horizontal ? .resizeLeftRight : .resizeUpDown }
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
     override func resetCursorRects() {
         super.resetCursorRects()
         addCursorRect(bounds, cursor: resizeCursor)
     }
 
-    override func cursorUpdate(with event: NSEvent) {
-        resizeCursor.set()
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let tracking { removeTrackingArea(tracking) }
+        let area = NSTrackingArea(
+            rect: .zero,
+            options: [.cursorUpdate, .mouseMoved, .mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(area)
+        tracking = area
     }
 
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if window == nil { dragStartPoint = nil }
+    }
+
+    override func cursorUpdate(with event: NSEvent) { resizeCursor.set() }
+    override func mouseMoved(with event: NSEvent) { resizeCursor.set() }
+
     override func mouseEntered(with event: NSEvent) {
-        isInside = true
-        onHoverChanged(true)
         resizeCursor.set()
+        onHoverChanged?(true)
     }
 
     override func mouseExited(with event: NSEvent) {
-        isInside = false
-        onHoverChanged(false)
-        if !isDragging {
-            NSCursor.arrow.set()
-        }
-    }
-
-    override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
-        true
+        onHoverChanged?(false)
     }
 
     override func mouseDown(with event: NSEvent) {
-        isDragging = true
-        dragStartInWindow = event.locationInWindow
-        onDragStateChanged(true)
+        guard let window else { return }
+        // Screen coordinates do not move when the divider resizes either pane.
+        dragStartPoint = window.convertPoint(toScreen: event.locationInWindow)
         resizeCursor.set()
-        onDragStarted()
+        onDragStarted?()
     }
 
     override func mouseDragged(with event: NSEvent) {
-        guard let dragStartInWindow else { return }
-        onDragChanged(translation(from: dragStartInWindow, to: event.locationInWindow))
+        guard let translation = translation(for: event) else { return }
+        resizeCursor.set()
+        onDragChanged?(translation)
     }
 
     override func mouseUp(with event: NSEvent) {
-        guard let dragStartInWindow else { return }
-        onDragEnded(translation(from: dragStartInWindow, to: event.locationInWindow))
-        self.dragStartInWindow = nil
-        isDragging = false
-        onDragStateChanged(false)
-        (isInside ? resizeCursor : NSCursor.arrow).set()
+        guard let translation = translation(for: event) else { return }
+        dragStartPoint = nil
+        onDragEnded?(translation)
     }
 
-    func update(
-        axis: LitheSplitAxis,
-        onHoverChanged: @escaping (Bool) -> Void,
-        onDragStateChanged: @escaping (Bool) -> Void,
-        onDragStarted: @escaping () -> Void,
-        onDragChanged: @escaping (CGFloat) -> Void,
-        onDragEnded: @escaping (CGFloat) -> Void
-    ) {
-        self.axis = axis
-        self.onHoverChanged = onHoverChanged
-        self.onDragStateChanged = onDragStateChanged
-        self.onDragStarted = onDragStarted
-        self.onDragChanged = onDragChanged
-        self.onDragEnded = onDragEnded
-        window?.invalidateCursorRects(for: self)
-    }
-
-    func cancelInteraction() {
-        dragStartInWindow = nil
-        if isDragging {
-            isDragging = false
-            onDragStateChanged(false)
-        }
-        if isInside {
-            isInside = false
-            onHoverChanged(false)
-        }
-        NSCursor.arrow.set()
-    }
-
-    private var resizeCursor: NSCursor {
-        axis == .horizontal ? .resizeLeftRight : .resizeUpDown
-    }
-
-    private func translation(from start: NSPoint, to current: NSPoint) -> CGFloat {
-        axis == .horizontal ? current.x - start.x : start.y - current.y
-    }
-
-    deinit {
-        if isDragging || isInside {
-            NSCursor.arrow.set()
-        }
+    private func translation(for event: NSEvent) -> CGFloat? {
+        guard let window, let dragStartPoint else { return nil }
+        let point = window.convertPoint(toScreen: event.locationInWindow)
+        // Match SwiftUI's downward-positive vertical translation contract.
+        return axis == .horizontal ? point.x - dragStartPoint.x : dragStartPoint.y - point.y
     }
 }

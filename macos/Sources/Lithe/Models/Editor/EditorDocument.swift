@@ -1,4 +1,6 @@
+import Combine
 import Foundation
+import LitheCoreContracts
 
 @MainActor
 final class EditorDocument: ObservableObject, Identifiable, @unchecked Sendable {
@@ -17,6 +19,8 @@ final class EditorDocument: ObservableObject, Identifiable, @unchecked Sendable 
     private(set) var url: URL
     let isReadOnly: Bool
     let displayPath: String?
+    /// Preview subscribers receive live edits without invalidating the editor hierarchy.
+    let textDidChange = PassthroughSubject<Void, Never>()
     private var storedText: String
     var text: String {
         get { storedText }
@@ -25,6 +29,7 @@ final class EditorDocument: ObservableObject, Identifiable, @unchecked Sendable 
     @Published private(set) var savedText: String
     private(set) var lifecycleState: DocumentLifecycleState
     private(set) var lastKnownModificationDate: Date?
+    private var pendingLanguageServerChanges: [LanguageServerDocumentChange] = []
 
     init(
         url: URL,
@@ -59,6 +64,51 @@ final class EditorDocument: ObservableObject, Identifiable, @unchecked Sendable 
         replaceText(newText, publish: isDirty != remainsUnpersisted)
     }
 
+    /// Applies the editor's latest change without asking the NSTextView for a
+    /// full document snapshot. The editor and document model stay in lockstep
+    /// through the same UTF-16 range used by NSTextView.
+    func applyLiveEditorEdit(replacedRange: NSRange, replacement: String) {
+        let source = storedText as NSString
+        guard replacedRange.location != NSNotFound,
+              replacedRange.location >= 0,
+              replacedRange.length >= 0,
+              replacedRange.location <= source.length,
+              replacedRange.length <= source.length - replacedRange.location else {
+            return
+        }
+        let start = Self.position(at: replacedRange.location, in: source)
+        let end = Self.position(at: NSMaxRange(replacedRange), in: source)
+        pendingLanguageServerChanges.append(
+            LanguageServerDocumentChange(
+                start: start,
+                end: end,
+                text: replacement
+            )
+        )
+        let nextText = source.replacingCharacters(in: replacedRange, with: replacement)
+        applyLiveEditorText(nextText)
+    }
+
+    func takePendingLanguageServerChanges() -> [LanguageServerDocumentChange] {
+        defer { pendingLanguageServerChanges.removeAll(keepingCapacity: true) }
+        return pendingLanguageServerChanges
+    }
+
+    private static func position(
+        at offset: Int,
+        in source: NSString
+    ) -> LanguageServerDocumentPosition {
+        let safeOffset = min(max(offset, 0), source.length)
+        let lineRange = source.lineRange(
+            for: NSRange(location: safeOffset, length: 0)
+        )
+        return LanguageServerDocumentPosition(
+            line: source.substring(with: NSRange(location: 0, length: lineRange.location))
+                .split(separator: "\n", omittingEmptySubsequences: false).count - 1,
+            utf16Column: safeOffset - lineRange.location
+        )
+    }
+
     private func replaceText(_ newText: String, publish: Bool) {
         guard storedText != newText else { return }
         let nextRevision = lifecycleState.revision + 1
@@ -87,6 +137,7 @@ final class EditorDocument: ObservableObject, Identifiable, @unchecked Sendable 
         }
         storedText = newText
         lifecycleState = nextLifecycle
+        textDidChange.send()
     }
 
     func save() throws {
@@ -98,6 +149,7 @@ final class EditorDocument: ObservableObject, Identifiable, @unchecked Sendable 
     func reloadFromDisk() throws {
         let contents = try String(contentsOf: url, encoding: .utf8)
         storedText = contents
+        textDidChange.send()
         savedText = contents
         lifecycleState = .clean(revision: lifecycleState.revision + 1)
         lastKnownModificationDate = Self.modificationDate(for: url)

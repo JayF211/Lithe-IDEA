@@ -5,8 +5,9 @@ const executeCore = mock(async () => ({
   ok: true as const,
   data: { document: "{}" },
 }));
+const cancelCoreOperation = mock(async () => true);
 
-mock.module("@/core/lithe-core-client", () => ({ executeCore }));
+mock.module("@/core/lithe-core-client", () => ({ executeCore, cancelCoreOperation }));
 
 const { createLaunchPlan, saveRunConfigurationEditorChanges } = await import("./run-core-api");
 
@@ -43,6 +44,31 @@ describe("saveRunConfigurationEditorChanges", () => {
           configurationId: "spring",
           currentFile: undefined,
           mavenContext,
+          debugPort: undefined,
+        },
+      }),
+    );
+  });
+
+  test("forwards the JDWP port without changing the Maven context", async () => {
+    const mavenContext = {
+      version: 1 as const,
+      reactorPath: ".",
+      profiles: ["debug"],
+      skipTests: false,
+    };
+
+    await createLaunchPlan("D:/fixture/project", "spring", undefined, mavenContext, 5005);
+
+    expect(executeCore).toHaveBeenCalledWith(
+      expect.objectContaining({
+        command: "runConfig.createLaunchPlan",
+        payload: {
+          root: "D:/fixture/project",
+          configurationId: "spring",
+          currentFile: undefined,
+          mavenContext,
+          debugPort: 5005,
         },
       }),
     );

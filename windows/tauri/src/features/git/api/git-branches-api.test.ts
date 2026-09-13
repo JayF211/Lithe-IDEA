@@ -4,6 +4,7 @@ import * as gitEvents from "../events/git-events";
 const invoke = mock(async (command: string): Promise<unknown> =>
   command === "git_discover_repo" ? "C:/repo" : null,
 );
+let gitWriteResult: { output?: string; exitCode?: number } | null = null;
 const emitGitChanged = spyOn(gitEvents, "emitGitChanged");
 
 mock.module("@/platform/tauri-core", () => ({ invoke }));
@@ -16,14 +17,22 @@ const {
   renameBranch,
   setBranchUpstream,
   unsetBranchUpstream,
+  updateBranch,
 } = await import("./git-branches-api");
 
 beforeEach(() => {
   invoke.mockReset();
   invoke.mockImplementation(async (command: string) =>
-    command === "git_discover_repo" ? "C:/repo" : command === "git.checkoutPreflight" ? { blockingPaths: [] } : null,
+    command === "git_discover_repo"
+      ? "C:/repo"
+      : command === "git.checkoutPreflight"
+        ? { blockingPaths: [] }
+        : command === "git.write"
+          ? gitWriteResult
+          : null,
   );
   emitGitChanged.mockClear();
+  gitWriteResult = null;
 });
 
 describe("Git branch reference mutations", () => {
@@ -31,6 +40,7 @@ describe("Git branch reference mutations", () => {
     fullName: "refs/remotes/origin/feature/orders",
     shortName: "origin/feature/orders",
     kind: "remote" as const,
+    peelsToCommit: true,
     isCurrent: false,
   };
 
@@ -109,6 +119,7 @@ describe("Git branch reference mutations", () => {
       fullName: "refs/remotes/origin/main",
       shortName: "origin/main",
       kind: "remote" as const,
+      peelsToCommit: true,
       isCurrent: false,
     };
     await setBranchUpstream("C:/repo", "main", upstream);
@@ -128,5 +139,44 @@ describe("Git branch reference mutations", () => {
       operation: "unsetUpstream",
       name: "main",
     });
+  });
+
+  test("updates a selected local branch through its complete Core identity", async () => {
+    const localReference = {
+      fullName: "refs/heads/feature/orders",
+      shortName: "feature/orders",
+      kind: "local" as const,
+      peelsToCommit: true,
+      isCurrent: false,
+      upstreamShortName: "origin/feature/orders",
+      behind: 2,
+    };
+
+    await updateBranch("C:/repo", localReference);
+
+    expect(invoke).toHaveBeenCalledWith("git.write", {
+      repoPath: "C:/repo",
+      operation: "updateBranch",
+      gitReference: {
+        fullName: localReference.fullName,
+        shortName: localReference.shortName,
+        kind: localReference.kind,
+      },
+    });
+  });
+
+  test("rejects a failed update without emitting a successful refresh", async () => {
+    gitWriteResult = { output: "branch update diverged", exitCode: 1 };
+
+    await expect(updateBranch("C:/repo", {
+      fullName: "refs/heads/feature/orders",
+      shortName: "feature/orders",
+      kind: "local",
+      peelsToCommit: true,
+      isCurrent: false,
+      upstreamShortName: "origin/feature/orders",
+      behind: 2,
+    })).rejects.toThrow("branch update diverged");
+    expect(emitGitChanged).not.toHaveBeenCalled();
   });
 });

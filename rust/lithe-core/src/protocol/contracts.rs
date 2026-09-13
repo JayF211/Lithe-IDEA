@@ -76,6 +76,23 @@ pub struct WorkspaceSnapshotResponse {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+/// One Git repository discovered for an opened workspace.
+pub struct WorkspaceRepositoryResponse {
+    /// Absolute native repository root path reported by the host filesystem.
+    /// Windows paths are plain drive or UNC paths without the verbatim `\\?\`
+    /// prefix that canonicalization adds.
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+/// Deterministically ordered Git repositories discovered below a workspace root.
+pub struct WorkspaceRepositoriesResponse {
+    pub repositories: Vec<WorkspaceRepositoryResponse>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 /// File, content, or symbol match with optional source location.
 pub struct SearchMatch {
     /// Result category: file path, file content, or symbol.
@@ -174,7 +191,36 @@ pub struct MavenModuleResponse {
     pub artifact_id: String,
     pub version: Option<String>,
     pub packaging: String,
+    pub source_roots: Vec<MavenSourceRootResponse>,
     pub modules: Vec<MavenModuleResponse>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+/// One Maven source root relative to its owning module.
+pub struct MavenSourceRootResponse {
+    /// Module-relative path using `/` separators.
+    pub path: String,
+    /// Semantic source-set used by project and Java tooling views.
+    pub kind: MavenSourceRootKind,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+/// Maven source-root categories kept distinct for main, test, and generated code.
+pub enum MavenSourceRootKind {
+    /// Production Java sources.
+    MainJava,
+    /// Production resource files.
+    MainResources,
+    /// Test Java sources.
+    TestJava,
+    /// Test resource files.
+    TestResources,
+    /// Generated production sources.
+    GeneratedMain,
+    /// Generated test sources.
+    GeneratedTest,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -186,6 +232,7 @@ pub struct MavenScanResponse {
     pub artifact_id: String,
     pub version: Option<String>,
     pub packaging: String,
+    pub source_roots: Vec<MavenSourceRootResponse>,
     pub modules: Vec<MavenModuleResponse>,
     pub profiles: Vec<MavenProfileResponse>,
     pub has_wrapper: bool,
@@ -211,6 +258,47 @@ pub struct MavenLaunchPlanResponse {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+/// Resolution outcome reported by Maven for one dependency coordinate.
+pub enum MavenDependencyResolutionResponse {
+    /// Maven selected this dependency in the effective tree.
+    Resolved,
+    /// Maven omitted this occurrence because the same dependency was already selected.
+    OmittedDuplicate,
+    /// Maven omitted this occurrence in favor of another version.
+    OmittedConflict,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+/// One bounded Maven dependency node with recursively nested transitive children.
+pub struct MavenDependencyResponse {
+    /// Reactor-relative module whose POM produced this dependency tree.
+    pub module_path: String,
+    pub group_id: String,
+    pub artifact_id: String,
+    pub version: String,
+    /// Maven artifact type such as `jar`, `war`, or `test-jar`.
+    pub r#type: String,
+    /// Optional Maven classifier such as `tests`.
+    pub classifier: Option<String>,
+    pub scope: String,
+    pub resolution: MavenDependencyResolutionResponse,
+    /// Version Maven selected when this occurrence was omitted for conflict.
+    pub selected_version: Option<String>,
+    pub children: Vec<MavenDependencyResponse>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+/// Deterministically ordered dependency tree for one Maven reactor module.
+pub struct MavenDependenciesResponse {
+    /// Reactor-relative module path, using `.` for the reactor root.
+    pub module_path: String,
+    pub dependencies: Vec<MavenDependencyResponse>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 /// One normalized issue parsed from Maven process output.
 pub struct MavenDiagnosticResponse {
     pub path: String,
@@ -225,6 +313,44 @@ pub struct MavenDiagnosticResponse {
 /// Maven diagnostics in stable source order.
 pub struct MavenDiagnosticsResponse {
     pub issues: Vec<MavenDiagnosticResponse>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+/// One failed or errored JUnit test reported by Maven Surefire/Failsafe.
+pub struct MavenTestFailureResponse {
+    /// Provider-reported test name, usually `method(Class)` or `Class.method`.
+    pub name: String,
+    /// Either `failure` or `error`, matching the Surefire result section.
+    pub kind: String,
+    /// Short assertion or exception message when Maven printed one.
+    pub message: Option<String>,
+    /// Workspace-relative source path when a stack frame resolves to a file.
+    pub path: Option<String>,
+    /// One-based source line from the first matching stack frame.
+    pub line: Option<usize>,
+    /// UTF-16 column is not emitted by Surefire's text reporter.
+    pub column: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+/// Bounded, deterministic JUnit result summary parsed from Maven output.
+pub struct MavenTestResultsResponse {
+    /// Total tests from the final Results summary or aggregated class summaries.
+    pub tests_run: usize,
+    /// Tests that failed an assertion.
+    pub failures: usize,
+    /// Tests that terminated with an error or exception.
+    pub errors: usize,
+    /// Tests skipped by assumptions, tags, or configuration.
+    pub skipped: usize,
+    /// Derived number of tests that completed successfully.
+    pub passed: usize,
+    /// True when the parsed summary contains no failures or errors.
+    pub success: bool,
+    /// Individual failures and errors in the order Maven reported them.
+    pub failure_details: Vec<MavenTestFailureResponse>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -305,6 +431,24 @@ pub struct JavaSourceDefinitionResponse {
     pub utf16_column: usize,
 }
 
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+/// One JUnit test method and its complete source range.
+pub struct JavaTestMethodResponse {
+    pub name: String,
+    /// Zero-based line containing the method name.
+    pub line: usize,
+    /// Zero-based line containing the method body's closing brace.
+    pub end_line: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+/// JUnit test methods in deterministic source order.
+pub struct JavaTestMethodsResponse {
+    pub methods: Vec<JavaTestMethodResponse>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 /// Server port declared by Spring configuration, when one is present.
@@ -345,6 +489,17 @@ pub struct JavaSyntaxHighlightResponse {
     pub role: String,
 }
 
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+/// One JUnit test method discovered from the Java syntax tree.
+pub struct JavaStructureTestMethodResponse {
+    pub name: String,
+    /// One-based line containing the method name.
+    pub line: usize,
+    /// Inclusive one-based line containing the end of the declaration.
+    pub end_line: usize,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 /// Lightweight structural features derived from one Java source document.
@@ -352,6 +507,8 @@ pub struct JavaStructureResponse {
     pub fold_regions: Vec<JavaFoldRegionResponse>,
     pub inlay_hints: Vec<JavaInlayHintResponse>,
     pub syntax_highlights: Vec<JavaSyntaxHighlightResponse>,
+    /// JUnit 4 and JUnit 5 methods in source order.
+    pub test_methods: Vec<JavaStructureTestMethodResponse>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -401,12 +558,46 @@ pub struct GitWatchContextResponse {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+/// One checkout registered in a repository's shared worktree metadata.
+pub struct GitWorktreeResponse {
+    /// Absolute checkout path reported by Git. Linked worktrees may live outside the opened workspace.
+    pub path: String,
+    /// Commit currently checked out by this worktree.
+    pub head: String,
+    /// Fully qualified local branch reference, absent for detached or bare worktrees.
+    pub branch: Option<String>,
+    /// Whether this is the worktree from which the request was made.
+    pub is_current: bool,
+    /// Whether this is the repository's primary worktree.
+    pub is_primary: bool,
+    pub is_bare: bool,
+    pub is_detached: bool,
+    pub is_locked: bool,
+    /// Human-readable lock reason supplied to Git, when present.
+    pub lock_reason: Option<String>,
+    pub is_prunable: bool,
+    /// Git's explanation for why the registration can be pruned.
+    pub prune_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+/// Deterministically ordered worktrees registered for one repository.
+pub struct GitWorktreesResponse {
+    pub worktrees: Vec<GitWorktreeResponse>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 /// Local or remote Git reference in display-ready form.
 pub struct GitReferenceResponse {
     pub full_name: String,
     pub short_name: String,
     /// Reference category: local branch, remote branch, or tag.
     pub kind: String,
+    /// Whether the reference resolves to a commit and therefore supports
+    /// commit-only mutations such as restorable tag deletion.
+    pub peels_to_commit: bool,
     pub is_current: bool,
     pub upstream_short_name: Option<String>,
     /// Commits present only on this local branch compared with its upstream.
@@ -440,6 +631,39 @@ pub struct GitHistoryResponse {
     pub has_more: bool,
     pub user_name: Option<String>,
     pub user_email: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+/// Repository references and identity metadata loaded independently from commit pages.
+pub struct GitReferencesResponse {
+    pub references: Vec<GitReferenceResponse>,
+    /// Up to five local branches ordered from most to least recently checked out.
+    pub recent_references: Vec<GitReferenceResponse>,
+    pub user_name: Option<String>,
+    pub user_email: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+/// One bounded page of commit history.
+pub struct GitHistoryPageResponse {
+    pub commits: Vec<GitCommitResponse>,
+    /// Opaque cursor for the next page, or `None` when this page reaches the end.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    /// Deprecated offset emitted only for compatibility with offset-based requests.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_offset: Option<usize>,
+    pub has_more: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+/// Result of explicitly releasing an incremental Git history cursor.
+pub struct GitHistoryCursorCloseResponse {
+    /// Whether an active cursor was found and released.
+    pub closed: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -738,4 +962,44 @@ pub struct SpringIndexResponse {
     pub beans: Vec<SpringBeanResponse>,
     pub injections: Vec<SpringInjectionResponse>,
     pub endpoints: Vec<SpringEndpointResponse>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+/// One MyBatis statement that has both a Java mapper method and an XML `id`.
+pub struct MybatisStatementResponse {
+    /// Stable identity: namespace, statement id, XML path, and XML line.
+    pub id: String,
+    /// Fully qualified mapper type from the XML `namespace`.
+    pub namespace: String,
+    /// XML statement `id`, which matches the Java method name.
+    pub statement_id: String,
+    /// MyBatis statement kind: `select`, `insert`, `update`, or `delete`.
+    pub kind: String,
+    /// Workspace-relative Java mapper path.
+    pub java_path: String,
+    /// One-based line of the Java method name.
+    pub java_line: usize,
+    /// One-based UTF-16 column of the Java method name.
+    pub java_column: usize,
+    /// One-based line of the Java method signature terminator.
+    pub java_end_line: usize,
+    /// Exclusive one-based UTF-16 column after the Java method name.
+    pub java_end_column: usize,
+    /// Workspace-relative mapper XML path.
+    pub xml_path: String,
+    /// One-based line of the XML statement `id` value.
+    pub xml_line: usize,
+    /// One-based UTF-16 column of the XML statement `id` value.
+    pub xml_column: usize,
+    /// Exclusive one-based UTF-16 column after the XML statement `id` value.
+    pub xml_end_column: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+/// Complete deterministic MyBatis mapper/XML index for one workspace snapshot.
+pub struct MybatisIndexResponse {
+    /// Paired Java methods and XML statements, ordered by namespace and id.
+    pub statements: Vec<MybatisStatementResponse>,
 }

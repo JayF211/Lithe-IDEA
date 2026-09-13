@@ -2,15 +2,18 @@
 
 use crate::protocol::{CoreError, ErrorCode};
 use crate::protocol::{
+    MavenDependenciesResponse, MavenDependencyResolutionResponse, MavenDependencyResponse,
     MavenDiagnosticResponse, MavenDiagnosticsResponse, MavenLaunchExecutableResponse,
     MavenLaunchPlanResponse, MavenModuleResponse, MavenProfileResponse, MavenScanResponse,
+    MavenSourceRootKind, MavenSourceRootResponse, MavenTestFailureResponse,
+    MavenTestResultsResponse,
 };
 use quick_xml::events::Event;
 use quick_xml::Reader;
 use regex::Regex;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
@@ -31,7 +34,23 @@ pub struct MavenDiagnosticsRequest {
     pub output: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+/// Maven Surefire/Failsafe output to normalize into JUnit result data.
+pub struct MavenTestResultsRequest {
+    pub root: String,
+    pub output: String,
+}
+
 const MAVEN_CONTEXT_VERSION: u32 = 1;
+const MAVEN_DEPENDENCY_PLUGIN_GOAL: &str =
+    "org.apache.maven.plugins:maven-dependency-plugin:3.8.1:tree";
+const MAX_MAVEN_DEPENDENCY_OUTPUT_CHARACTERS: usize = 500_000;
+const MAX_MAVEN_DEPENDENCY_NODES: usize = 10_000;
+const MAX_MAVEN_DEPENDENCY_DEPTH: usize = 64;
+const MAX_MAVEN_TEST_OUTPUT_CHARACTERS: usize = 500_000;
+const MAX_MAVEN_TEST_FAILURES: usize = 10_000;
+const MAX_MAVEN_TEST_SOURCE_SEARCH_DIRECTORIES: usize = 10_000;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -43,6 +62,8 @@ pub struct MavenLaunchContextRequest {
     pub profiles: Vec<String>,
     #[serde(default)]
     pub settings_path: Option<String>,
+    #[serde(default)]
+    pub local_repository_path: Option<String>,
     #[serde(default)]
     pub skip_tests: bool,
     #[serde(default)]
@@ -65,6 +86,24 @@ pub struct MavenLaunchPlanRequest {
     pub goals: Vec<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+/// One bounded dependency-tree invocation for a validated Maven module.
+pub struct MavenDependencyPlanRequest {
+    pub root: String,
+    pub context: MavenLaunchContextRequest,
+    #[serde(default)]
+    pub module: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+/// Captured Maven dependency-plugin output associated with one reactor module.
+pub struct MavenDependenciesRequest {
+    pub module_path: String,
+    pub output: String,
+}
+
 #[derive(Debug, Clone)]
 /// Validated Maven import settings consumed by the JDT LS adapter.
 pub(crate) struct MavenJdtConfiguration {
@@ -72,6 +111,8 @@ pub(crate) struct MavenJdtConfiguration {
     pub settings_path: Option<String>,
     /// Workspace-relative reactor and recursive module directories.
     pub project_paths: Vec<String>,
+    /// Workspace-relative Java source directories imported by JDT LS.
+    pub source_paths: Vec<String>,
 }
 
 struct ValidatedMavenContext {
@@ -79,6 +120,7 @@ struct ValidatedMavenContext {
     canonical_reactor: PathBuf,
     profiles: Vec<String>,
     settings_path: Option<String>,
+    local_repository_path: Option<String>,
     skip_tests: bool,
     maven_executable_path: Option<String>,
     java_home_path: Option<String>,
@@ -93,6 +135,26 @@ pub fn launch_plan(request: MavenLaunchPlanRequest) -> Result<MavenLaunchPlanRes
         request.module,
         arguments,
         true,
+    )
+}
+
+/// Produces a fixed, non-recursive Maven dependency-tree invocation.
+pub fn dependency_plan(
+    request: MavenDependencyPlanRequest,
+) -> Result<MavenLaunchPlanResponse, CoreError> {
+    launch_plan_with_arguments(
+        request.root,
+        request.context,
+        request.module,
+        vec![
+            MAVEN_DEPENDENCY_PLUGIN_GOAL.to_string(),
+            "-Dverbose=true".to_string(),
+            "-DoutputType=text".to_string(),
+            "-Dstyle.color=never".to_string(),
+            "-Duser.language=en".to_string(),
+            "-Duser.country=US".to_string(),
+        ],
+        false,
     )
 }
 
@@ -131,6 +193,7 @@ pub(crate) fn launch_plan_with_arguments(
     let arguments = maven_arguments(
         &validated.profiles,
         validated.settings_path.as_deref(),
+        validated.local_repository_path.as_deref(),
         module.as_deref(),
         also_make,
         validated.skip_tests,
@@ -140,6 +203,7 @@ pub(crate) fn launch_plan_with_arguments(
         &validated.reactor_path,
         &validated.profiles,
         validated.settings_path.as_deref(),
+        validated.local_repository_path.as_deref(),
         validated.skip_tests,
         validated.maven_executable_path.as_deref(),
         validated.java_home_path.as_deref(),
@@ -162,22 +226,42 @@ pub(crate) fn jdt_configuration(
     context: MavenLaunchContextRequest,
 ) -> Result<MavenJdtConfiguration, CoreError> {
     let validated = validated_maven_context(root, context)?;
-    let project_paths = declared_modules(&validated.canonical_reactor)?
-        .into_iter()
-        .map(|module| {
+    let declared = declared_modules(&validated.canonical_reactor)?;
+    let mut project_paths = Vec::with_capacity(declared.len());
+    let mut source_paths = BTreeSet::new();
+    for module in declared {
+        let module_path = {
             if module.relative_path == "." {
                 validated.reactor_path.clone()
             } else if validated.reactor_path == "." {
-                module.relative_path
+                module.relative_path.clone()
             } else {
                 format!("{}/{}", validated.reactor_path, module.relative_path)
             }
-        })
-        .collect();
+        };
+        project_paths.push(module_path.clone());
+        for source_root in module.source_roots {
+            if !matches!(
+                source_root.kind,
+                MavenSourceRootKind::MainJava
+                    | MavenSourceRootKind::TestJava
+                    | MavenSourceRootKind::GeneratedMain
+                    | MavenSourceRootKind::GeneratedTest
+            ) {
+                continue;
+            }
+            source_paths.insert(if module_path == "." {
+                source_root.path
+            } else {
+                format!("{module_path}/{}", source_root.path)
+            });
+        }
+    }
     Ok(MavenJdtConfiguration {
         profiles: validated.profiles,
         settings_path: validated.settings_path,
         project_paths,
+        source_paths: source_paths.into_iter().collect(),
     })
 }
 
@@ -217,6 +301,10 @@ fn validated_maven_context(
         canonical_reactor,
         profiles: normalized_profiles(context.profiles)?,
         settings_path: normalized_local_path(context.settings_path, "Maven settings")?,
+        local_repository_path: normalized_local_path(
+            context.local_repository_path,
+            "Maven local repository",
+        )?,
         skip_tests: context.skip_tests,
         maven_executable_path: normalized_local_path(
             context.maven_executable_path,
@@ -230,6 +318,7 @@ fn validated_maven_context(
 pub(crate) fn maven_arguments(
     profiles: &[String],
     settings_path: Option<&str>,
+    local_repository_path: Option<&str>,
     module: Option<&str>,
     also_make: bool,
     skip_tests: bool,
@@ -241,6 +330,9 @@ pub(crate) fn maven_arguments(
     }
     if let Some(settings_path) = settings_path {
         arguments.extend(["-s".to_string(), settings_path.to_string()]);
+    }
+    if let Some(local_repository_path) = local_repository_path {
+        arguments.push(format!("-Dmaven.repo.local={local_repository_path}"));
     }
     if let Some(module) = module.filter(|value| *value != ".") {
         arguments.extend(["-pl".to_string(), module.to_string()]);
@@ -336,6 +428,7 @@ fn maven_context_fingerprint(
     reactor_path: &str,
     profiles: &[String],
     settings_path: Option<&str>,
+    local_repository_path: Option<&str>,
     skip_tests: bool,
     maven_executable_path: Option<&str>,
     java_home_path: Option<&str>,
@@ -346,6 +439,7 @@ fn maven_context_fingerprint(
         reactor_path.to_string(),
         profiles.join(","),
         settings_path.unwrap_or_default().to_string(),
+        local_repository_path.unwrap_or_default().to_string(),
         skip_tests.to_string(),
         maven_executable_path.unwrap_or_default().to_string(),
         java_home_path.unwrap_or_default().to_string(),
@@ -363,9 +457,26 @@ struct Descriptor {
     artifact_id: Option<String>,
     version: Option<String>,
     packaging: String,
+    build_directory: Option<String>,
     module_paths: Vec<String>,
     profiles: Vec<MavenProfileResponse>,
     plugins: Vec<String>,
+    source_directory: Option<String>,
+    test_source_directory: Option<String>,
+    resource_directories: Vec<String>,
+    test_resource_directories: Vec<String>,
+    generated_source_directories: Vec<String>,
+    generated_test_source_directories: Vec<String>,
+}
+
+#[derive(Debug, Default)]
+/// Configuration buffered until the owning build plugin's `artifactId` is known.
+struct PendingBuildPlugin {
+    artifact_id: Option<String>,
+    compiler_generated_source_directories: Vec<String>,
+    compiler_generated_test_source_directories: Vec<String>,
+    build_helper_source_directories: Vec<String>,
+    build_helper_test_source_directories: Vec<String>,
 }
 
 /// One module of the declared build graph, flattened with the root first.
@@ -383,6 +494,8 @@ pub struct DeclaredModule {
     pub packaging: String,
     /// `artifactId` of every plugin the module applies in `<build><plugins>`.
     pub plugins: Vec<String>,
+    /// Source roots parsed from this module's own POM.
+    pub source_roots: Vec<MavenSourceRootResponse>,
 }
 
 impl DeclaredModule {
@@ -427,6 +540,7 @@ fn collect_modules(
         .map(|value| value.to_string_lossy().replace('\\', "/"))
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| ".".to_string());
+    let current_source_roots = source_roots(Some(&current));
     modules.push(DeclaredModule {
         relative_path,
         artifact_id: current.artifact_id.unwrap_or_else(|| {
@@ -438,6 +552,7 @@ fn collect_modules(
         }),
         packaging: current.packaging,
         plugins: current.plugins,
+        source_roots: current_source_roots,
     });
     for raw_path in &current.module_paths {
         let Some(relative) = normalize_relative_path(raw_path) else {
@@ -472,6 +587,7 @@ pub fn scan(request: MavenScanRequest) -> Result<Option<MavenScanResponse>, Core
         .iter()
         .filter_map(|path| module(&root, &root, path, &mut visited))
         .collect();
+    let source_roots = source_roots(Some(&root_descriptor));
 
     Ok(Some(MavenScanResponse {
         relative_path,
@@ -484,6 +600,7 @@ pub fn scan(request: MavenScanRequest) -> Result<Option<MavenScanResponse>, Core
         }),
         version: root_descriptor.version,
         packaging: root_descriptor.packaging,
+        source_roots,
         modules,
         profiles: root_descriptor.profiles,
         has_wrapper: has_wrapper(&root),
@@ -596,6 +713,857 @@ pub fn diagnostics(
     Ok(MavenDiagnosticsResponse { issues })
 }
 
+#[derive(Clone, Copy)]
+enum MavenTestFailureKind {
+    Failure,
+    Error,
+}
+
+impl MavenTestFailureKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Failure => "failure",
+            Self::Error => "error",
+        }
+    }
+}
+
+/// Parses the common text reporter used by Maven Surefire and Failsafe.
+///
+/// The parser deliberately consumes only bounded process output. XML report
+/// files remain platform-owned, while this command provides enough structure
+/// for both products to show counts and navigate the first useful stack frame.
+pub fn test_results(
+    request: MavenTestResultsRequest,
+) -> Result<MavenTestResultsResponse, CoreError> {
+    let workspace_root = existing_root(&request.root)?;
+    if request
+        .output
+        .chars()
+        .nth(MAX_MAVEN_TEST_OUTPUT_CHARACTERS)
+        .is_some()
+    {
+        return Err(CoreError::new(
+            ErrorCode::ParseFailed,
+            "Maven test output exceeds the supported limit",
+        )
+        .with_details(format!(
+            "maximumCharacters={MAX_MAVEN_TEST_OUTPUT_CHARACTERS}"
+        )));
+    }
+
+    let ansi =
+        Regex::new(r"\x1b\[[0-?]*[ -/]*[@-~]").expect("static ANSI escape expression is valid");
+    let summary_expression = Regex::new(
+        r"(?i)^Tests\s+run:\s*(\d+)\s*,\s*Failures:\s*(\d+)\s*,\s*Errors:\s*(\d+)\s*,\s*(?:Skipped|Ignored):\s*(\d+)(?:\s+-+\s+in\s+(.+)|,\s*Time elapsed:.*)?\s*$",
+    )
+    .expect("static Maven test summary expression is valid");
+    let failure_expression =
+        Regex::new(r#"^(?:\d+\)\s*)?([A-Za-z_$][A-Za-z0-9_.$#<>$\[\]'\" ()-]*?)(?:\s*:\s*(.*))?$"#)
+            .expect("static Maven test failure expression is valid");
+    let detailed_failure_expression = Regex::new(
+        r#"^([A-Za-z_$][A-Za-z0-9_.$#<>$\[\]'\" ()-]*?)\s+(?:--\s+)?Time elapsed:.*<<<\s+(FAILURE|ERROR)!\s*$"#,
+    )
+    .expect("static Maven detailed failure expression is valid");
+    let stack_expression = Regex::new(
+        r"^at\s+([A-Za-z_$][A-Za-z0-9_.$]*)(?:\.[A-Za-z_$][A-Za-z0-9_$<>]*)?\((.*?\.java):(\d+)\)$",
+    )
+    .expect("static Maven test stack expression is valid");
+
+    let mut footer_summary = (0_usize, 0_usize, 0_usize, 0_usize);
+    let mut class_summary = (0_usize, 0_usize, 0_usize, 0_usize);
+    let mut saw_footer_summary = false;
+    let mut saw_class_summary = false;
+    let mut section = None;
+    let mut current_failure = None;
+    let mut failure_details: Vec<MavenTestFailureResponse> = Vec::new();
+    let mut source_index = None;
+    let mut source_cache = HashMap::new();
+
+    for raw_line in request.output.lines() {
+        crate::protocol::cancellation::check()?;
+        let clean_line = ansi.replace_all(raw_line, "");
+        let line = strip_maven_log_prefix(clean_line.as_ref());
+        let trimmed = line.trim();
+        if trimmed.eq_ignore_ascii_case("Results:") {
+            section = None;
+            current_failure = None;
+            continue;
+        }
+        if let Some(captures) = summary_expression.captures(line.trim()) {
+            let parsed = (
+                captures[1].parse::<usize>().unwrap_or(0),
+                captures[2].parse::<usize>().unwrap_or(0),
+                captures[3].parse::<usize>().unwrap_or(0),
+                captures[4].parse::<usize>().unwrap_or(0),
+            );
+            let is_class_summary = captures.get(5).is_some() || trimmed.contains(", Time elapsed:");
+            if is_class_summary {
+                class_summary.0 = class_summary.0.saturating_add(parsed.0);
+                class_summary.1 = class_summary.1.saturating_add(parsed.1);
+                class_summary.2 = class_summary.2.saturating_add(parsed.2);
+                class_summary.3 = class_summary.3.saturating_add(parsed.3);
+                saw_class_summary = true;
+            } else {
+                footer_summary.0 = footer_summary.0.saturating_add(parsed.0);
+                footer_summary.1 = footer_summary.1.saturating_add(parsed.1);
+                footer_summary.2 = footer_summary.2.saturating_add(parsed.2);
+                footer_summary.3 = footer_summary.3.saturating_add(parsed.3);
+                saw_footer_summary = true;
+            }
+            // A summary terminates both the failure list and any preceding
+            // detailed failure. Do not let reactor diagnostics inherit it.
+            section = None;
+            current_failure = None;
+            continue;
+        }
+
+        if let Some(captures) = detailed_failure_expression.captures(trimmed) {
+            let name = captures
+                .get(1)
+                .map(|value| value.as_str())
+                .unwrap_or_default();
+            if looks_like_test_name(name) {
+                let kind = match captures.get(2).map(|value| value.as_str()) {
+                    Some("ERROR") => MavenTestFailureKind::Error,
+                    _ => MavenTestFailureKind::Failure,
+                };
+                current_failure = Some(record_maven_failure(
+                    &mut failure_details,
+                    name,
+                    kind,
+                    None,
+                )?);
+            }
+            continue;
+        }
+
+        if trimmed.eq_ignore_ascii_case("Failures:")
+            || trimmed.eq_ignore_ascii_case("Failed tests:")
+        {
+            section = Some(MavenTestFailureKind::Failure);
+            current_failure = None;
+            continue;
+        }
+        if trimmed.eq_ignore_ascii_case("Errors:") {
+            section = Some(MavenTestFailureKind::Error);
+            current_failure = None;
+            continue;
+        }
+        if trimmed.eq_ignore_ascii_case("Tests run:") || trimmed.starts_with("Tests run:") {
+            section = None;
+            current_failure = None;
+            continue;
+        }
+
+        if let Some(captures) = stack_expression.captures(trimmed) {
+            if let Some(index) = current_failure {
+                if failure_details
+                    .get(index)
+                    .is_some_and(|detail| detail.path.is_some())
+                {
+                    continue;
+                }
+                let line_number = captures[3].parse::<usize>().ok();
+                let location = if let Some(line_number) = line_number {
+                    resolve_test_source_path(
+                        &workspace_root,
+                        captures
+                            .get(1)
+                            .map(|value| value.as_str())
+                            .unwrap_or_default(),
+                        captures
+                            .get(2)
+                            .map(|value| value.as_str())
+                            .unwrap_or_default(),
+                        &mut source_index,
+                        &mut source_cache,
+                    )?
+                    .map(|path| (path, line_number))
+                } else {
+                    None
+                };
+                if let Some(detail) = failure_details.get_mut(index) {
+                    let detail: &mut MavenTestFailureResponse = detail;
+                    if let Some((path, line_number)) = location {
+                        detail.path = Some(path);
+                        detail.line = Some(line_number);
+                    }
+                }
+            }
+            continue;
+        }
+
+        let Some(kind) = section else { continue };
+        let Some(captures) = failure_expression.captures(trimmed) else {
+            continue;
+        };
+        let name = captures
+            .get(1)
+            .map(|value| value.as_str().trim())
+            .unwrap_or_default();
+        if !looks_like_test_name(name) {
+            continue;
+        }
+        let raw_message = captures
+            .get(2)
+            .map(|value| value.as_str().trim())
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        // Surefire's compact footer encodes the source line as
+        // `TestName:line message`. Preserve a detailed entry's location, or use
+        // the footer line when legacy output provides no usable stack frame.
+        let (footer_line, message) = raw_message.map_or((None, None), |value| {
+            let mut parts = value.splitn(2, char::is_whitespace);
+            match parts.next() {
+                Some(token) if token.parse::<usize>().is_ok() => (
+                    token.parse::<usize>().ok(),
+                    parts
+                        .next()
+                        .map(str::trim)
+                        .filter(|rest| !rest.is_empty())
+                        .map(str::to_string),
+                ),
+                _ => (None, Some(value)),
+            }
+        });
+        let index = record_maven_failure(&mut failure_details, name, kind, message)?;
+        if let Some(line_number) = footer_line {
+            resolve_footer_source_location(
+                &workspace_root,
+                &mut failure_details[index],
+                name,
+                line_number,
+                &mut source_index,
+                &mut source_cache,
+            )?;
+        }
+        current_failure = Some(index);
+    }
+
+    let (tests_run, failures, errors, skipped) = if saw_footer_summary {
+        footer_summary
+    } else if saw_class_summary {
+        class_summary
+    } else {
+        let failures = failure_details
+            .iter()
+            .filter(|detail| detail.kind == "failure")
+            .count();
+        let errors = failure_details
+            .iter()
+            .filter(|detail| detail.kind == "error")
+            .count();
+        (failures + errors, failures, errors, 0)
+    };
+    let passed = tests_run.saturating_sub(failures + errors + skipped);
+    Ok(MavenTestResultsResponse {
+        tests_run,
+        failures,
+        errors,
+        skipped,
+        passed,
+        success: failures == 0 && errors == 0,
+        failure_details,
+    })
+}
+
+fn strip_maven_log_prefix(raw_line: &str) -> &str {
+    let mut line = raw_line.trim_start();
+    loop {
+        let Some(rest) = line.strip_prefix('[') else {
+            break;
+        };
+        let Some(end) = rest.find(']') else { break };
+        let prefix = &rest[..end];
+        if !matches!(prefix, "INFO" | "ERROR" | "WARNING" | "DEBUG") {
+            break;
+        }
+        line = rest[end + 1..].trim_start();
+    }
+    line
+}
+
+fn looks_like_test_name(name: &str) -> bool {
+    !name.is_empty()
+        && (name.contains('(')
+            || name.contains('#')
+            || name.contains('.')
+            || name.ends_with("Test")
+            || name.ends_with("Tests"))
+        && !name.ends_with("Exception")
+        && !name.ends_with("Error")
+}
+
+fn same_maven_test_name(left: &str, right: &str) -> bool {
+    let left = normalized_maven_test_name(left);
+    let right = normalized_maven_test_name(right);
+    left == right
+        || left
+            .strip_suffix(&right)
+            .is_some_and(|prefix| prefix.ends_with('.'))
+        || right
+            .strip_suffix(&left)
+            .is_some_and(|prefix| prefix.ends_with('.'))
+}
+
+fn normalized_maven_test_name(name: &str) -> String {
+    let Some(opening) = name.rfind('(') else {
+        return name.to_string();
+    };
+    if !name.ends_with(')') {
+        return name.to_string();
+    }
+    let class_name = &name[(opening + 1)..name.len() - 1];
+    if !class_name.contains('.') || class_name.chars().any(char::is_whitespace) {
+        return name.to_string();
+    }
+    format!("{class_name}.{}", &name[..opening])
+}
+
+fn record_maven_failure(
+    details: &mut Vec<MavenTestFailureResponse>,
+    name: &str,
+    kind: MavenTestFailureKind,
+    message: Option<String>,
+) -> Result<usize, CoreError> {
+    if let Some(index) = details
+        .iter()
+        .position(|detail| same_maven_test_name(&detail.name, name))
+    {
+        if let Some(message) = message {
+            if details[index].message.is_none() {
+                details[index].message = Some(message);
+            }
+        }
+        return Ok(index);
+    }
+    if details.len() >= MAX_MAVEN_TEST_FAILURES {
+        return Err(CoreError::new(
+            ErrorCode::ParseFailed,
+            "Maven test failure count exceeds the supported limit",
+        )
+        .with_details(format!("maximumFailures={MAX_MAVEN_TEST_FAILURES}")));
+    }
+    details.push(MavenTestFailureResponse {
+        name: name.to_string(),
+        kind: kind.as_str().to_string(),
+        message,
+        path: None,
+        line: None,
+        column: None,
+    });
+    Ok(details.len() - 1)
+}
+
+fn resolve_test_source_path(
+    root: &Path,
+    class_name: &str,
+    file_name: &str,
+    source_index: &mut Option<MavenTestSourceIndex>,
+    source_cache: &mut HashMap<(String, String), Option<String>>,
+) -> Result<Option<String>, CoreError> {
+    crate::protocol::cancellation::check()?;
+    let cache_key = (class_name.to_string(), file_name.to_string());
+    if let Some(cached) = source_cache.get(&cache_key) {
+        return Ok(cached.clone());
+    }
+    let file_path = Path::new(file_name);
+    if file_path.is_absolute() {
+        if let Some(path) = workspace_relative_path(root, file_path) {
+            source_cache.insert(cache_key, Some(path.clone()));
+            return Ok(Some(path));
+        }
+    }
+
+    let class_name = class_name
+        .rsplit_once('.')
+        .map(|(class_name, _)| class_name)
+        .unwrap_or(class_name)
+        .split('$')
+        .next()
+        .unwrap_or(class_name);
+    let class_path = class_name.replace('.', "/") + ".java";
+    let simple_file_name = Path::new(file_name)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or(file_name);
+    if source_index.is_none() {
+        *source_index = Some(MavenTestSourceIndex::build(root)?);
+    }
+    let index = source_index
+        .as_ref()
+        .expect("source index should exist after construction");
+    let resolved = index.resolve(&class_path, simple_file_name);
+    source_cache.insert(cache_key, resolved.clone());
+    Ok(resolved)
+}
+
+fn resolve_footer_source_location(
+    root: &Path,
+    detail: &mut MavenTestFailureResponse,
+    name: &str,
+    line_number: usize,
+    source_index: &mut Option<MavenTestSourceIndex>,
+    source_cache: &mut HashMap<(String, String), Option<String>>,
+) -> Result<(), CoreError> {
+    if detail.path.is_some() {
+        return Ok(());
+    }
+    let normalized = normalized_maven_test_name(name);
+    let Some((class_name, _)) = normalized.rsplit_once('.') else {
+        return Ok(());
+    };
+    let simple_class = class_name
+        .rsplit('.')
+        .next()
+        .unwrap_or(class_name)
+        .split('$')
+        .next()
+        .unwrap_or(class_name);
+    let file_name = format!("{simple_class}.java");
+    if let Some(path) =
+        resolve_test_source_path(root, &normalized, &file_name, source_index, source_cache)?
+    {
+        detail.path = Some(path);
+        detail.line = Some(line_number);
+    }
+    Ok(())
+}
+
+/// One lazily built, parse-wide index bounds source traversal to 10,000
+/// directories total instead of repeating that cost for every stack frame.
+struct MavenTestSourceIndex {
+    paths: Vec<String>,
+    complete: bool,
+}
+
+impl MavenTestSourceIndex {
+    fn build(root: &Path) -> Result<Self, CoreError> {
+        let mut directories = vec![root.to_path_buf()];
+        let mut paths = Vec::new();
+        let mut visited = 0;
+        let mut complete = true;
+        while let Some(directory) = directories.pop() {
+            crate::protocol::cancellation::check()?;
+            if visited >= MAX_MAVEN_TEST_SOURCE_SEARCH_DIRECTORIES {
+                complete = false;
+                break;
+            }
+            visited += 1;
+            let entries = match fs::read_dir(&directory) {
+                Ok(entries) => entries,
+                Err(_) => {
+                    complete = false;
+                    continue;
+                }
+            };
+            let mut children = Vec::new();
+            for entry in entries {
+                crate::protocol::cancellation::check()?;
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(_) => {
+                        complete = false;
+                        continue;
+                    }
+                };
+                let file_type = match entry.file_type() {
+                    Ok(file_type) => file_type,
+                    Err(_) => {
+                        complete = false;
+                        continue;
+                    }
+                };
+                if file_type.is_dir() {
+                    if !should_skip_test_source_directory(&entry.path()) {
+                        children.push((entry.path(), true));
+                    }
+                } else if file_type.is_file()
+                    && matches!(
+                        entry.path().extension().and_then(|value| value.to_str()),
+                        Some("java" | "kt")
+                    )
+                {
+                    children.push((entry.path(), false));
+                }
+            }
+            children.sort_by(|left, right| {
+                left.0
+                    .to_string_lossy()
+                    .to_ascii_lowercase()
+                    .cmp(&right.0.to_string_lossy().to_ascii_lowercase())
+                    .then_with(|| left.0.cmp(&right.0))
+            });
+            for (path, is_directory) in children.into_iter().rev() {
+                if is_directory {
+                    directories.push(path);
+                } else if let Ok(relative) = path.strip_prefix(root) {
+                    // Traversal starts at root and excludes symlinks via file_type,
+                    // so lexical paths avoid two canonicalizations per source file.
+                    // Absolute paths from process output still require containment checks.
+                    paths.push(relative.to_string_lossy().replace('\\', "/"));
+                } else {
+                    complete = false;
+                }
+            }
+        }
+        paths.sort_by(|left, right| {
+            left.to_ascii_lowercase()
+                .cmp(&right.to_ascii_lowercase())
+                .then_with(|| left.cmp(right))
+        });
+        Ok(Self { paths, complete })
+    }
+
+    fn resolve(&self, class_path: &str, simple_file_name: &str) -> Option<String> {
+        // A partial index cannot prove uniqueness, so returning any candidate
+        // would risk navigating to a same-named source in another module.
+        if !self.complete {
+            return None;
+        }
+
+        let mut exact_matches = self
+            .paths
+            .iter()
+            .filter(|path| path_has_suffix(path, class_path));
+        if let Some(path) = exact_matches.next() {
+            return exact_matches.next().is_none().then(|| path.clone());
+        }
+
+        let mut file_name_matches = self.paths.iter().filter(|path| {
+            Path::new(path).file_name().and_then(|value| value.to_str()) == Some(simple_file_name)
+        });
+        let path = file_name_matches.next()?;
+        file_name_matches.next().is_none().then(|| path.clone())
+    }
+}
+
+fn path_has_suffix(path: &str, suffix: &str) -> bool {
+    path == suffix
+        || path
+            .strip_suffix(suffix)
+            .is_some_and(|prefix| prefix.ends_with('/'))
+}
+
+#[cfg(test)]
+mod test_source_index_tests {
+    use super::MavenTestSourceIndex;
+
+    #[test]
+    fn source_index_prefers_the_unique_package_path() {
+        let index = MavenTestSourceIndex {
+            paths: vec![
+                "src/test/java/AppTest.java".to_string(),
+                "service/src/test/java/com/example/AppTest.java".to_string(),
+            ],
+            complete: true,
+        };
+
+        assert_eq!(
+            index.resolve("com/example/AppTest.java", "AppTest.java"),
+            Some("service/src/test/java/com/example/AppTest.java".to_string())
+        );
+    }
+
+    #[test]
+    fn source_index_rejects_ambiguous_or_incomplete_results() {
+        let duplicate_index = MavenTestSourceIndex {
+            paths: vec![
+                "service-one/src/test/java/com/example/AppTest.java".to_string(),
+                "service-two/src/test/java/com/example/AppTest.java".to_string(),
+            ],
+            complete: true,
+        };
+        let incomplete_index = MavenTestSourceIndex {
+            paths: vec!["service/src/test/java/com/example/AppTest.java".to_string()],
+            complete: false,
+        };
+
+        assert_eq!(
+            duplicate_index.resolve("com/example/AppTest.java", "AppTest.java"),
+            None
+        );
+        assert_eq!(
+            incomplete_index.resolve("com/example/AppTest.java", "AppTest.java"),
+            None
+        );
+    }
+
+    #[test]
+    fn source_index_requires_a_path_boundary_and_unique_filename_fallback() {
+        let mut index = MavenTestSourceIndex {
+            paths: vec!["src/test/java/notcom/example/AppTest.java".to_string()],
+            complete: true,
+        };
+        assert_eq!(
+            index.resolve("com/example/AppTest.java", "AppTest.java"),
+            Some("src/test/java/notcom/example/AppTest.java".to_string())
+        );
+        index.paths.push("other/AppTest.java".to_string());
+        // The partial package suffix must not bypass ambiguous filename fallback.
+        assert_eq!(
+            index.resolve("com/example/AppTest.java", "AppTest.java"),
+            None
+        );
+    }
+}
+
+fn should_skip_test_source_directory(path: &Path) -> bool {
+    matches!(
+        path.file_name().and_then(|value| value.to_str()),
+        Some(".git" | ".gradle" | "node_modules" | "target" | "dist")
+    )
+}
+
+fn workspace_relative_path(root: &Path, path: &Path) -> Option<String> {
+    let canonical_root = root.canonicalize().ok()?;
+    let canonical_path = path.canonicalize().ok()?;
+    let relative = canonical_path.strip_prefix(canonical_root).ok()?;
+    Some(relative.to_string_lossy().replace('\\', "/"))
+}
+
+#[derive(Clone)]
+struct ParsedDependency {
+    depth: usize,
+    node: MavenDependencyResponse,
+}
+
+/// Parses bounded Maven dependency-plugin text into a deterministic tree.
+pub fn dependencies(
+    request: MavenDependenciesRequest,
+) -> Result<MavenDependenciesResponse, CoreError> {
+    if request
+        .output
+        .chars()
+        .nth(MAX_MAVEN_DEPENDENCY_OUTPUT_CHARACTERS)
+        .is_some()
+    {
+        return Err(CoreError::new(
+            ErrorCode::ParseFailed,
+            "Maven dependency output exceeds the supported limit",
+        )
+        .with_details(format!(
+            "maximumCharacters={MAX_MAVEN_DEPENDENCY_OUTPUT_CHARACTERS}"
+        )));
+    }
+    let module_path = normalized_project_path(&request.module_path, "Maven module")?;
+    let ansi =
+        Regex::new(r"\x1b\[[0-?]*[ -/]*[@-~]").expect("static ANSI escape expression is valid");
+    let mut parsed = Vec::new();
+    for raw_line in request.output.lines() {
+        let line = ansi.replace_all(raw_line, "");
+        let Some(entry) = parse_dependency_line(&line, &module_path)? else {
+            continue;
+        };
+        if parsed.len() == MAX_MAVEN_DEPENDENCY_NODES {
+            return Err(CoreError::new(
+                ErrorCode::ParseFailed,
+                "Maven dependency count exceeds the supported limit",
+            )
+            .with_details(format!("maximumNodes={MAX_MAVEN_DEPENDENCY_NODES}")));
+        }
+        parsed.push(entry);
+    }
+
+    let mut cursor = 0;
+    let dependencies = if parsed.is_empty() {
+        Vec::new()
+    } else {
+        if parsed[0].depth != 0 {
+            return Err(invalid_dependency_structure());
+        }
+        let dependencies = build_dependency_level(&parsed, &mut cursor, 0)?;
+        if cursor != parsed.len() {
+            return Err(invalid_dependency_structure());
+        }
+        dependencies
+    };
+    Ok(MavenDependenciesResponse {
+        module_path,
+        dependencies,
+    })
+}
+
+fn parse_dependency_line(
+    raw_line: &str,
+    module_path: &str,
+) -> Result<Option<ParsedDependency>, CoreError> {
+    let trimmed = raw_line.trim();
+    let line = trimmed
+        .strip_prefix("[INFO]")
+        .and_then(|value| value.strip_prefix(' '))
+        .unwrap_or(trimmed);
+    let marker = match (line.find("+- "), line.find("\\- ")) {
+        (Some(left), Some(right)) => left.min(right),
+        (Some(index), None) | (None, Some(index)) => index,
+        (None, None) => return Ok(None),
+    };
+    let prefix = &line[..marker];
+    let mut chunks = prefix.as_bytes().chunks_exact(3);
+    if !chunks.all(|chunk| chunk == b"|  " || chunk == b"   ") || !chunks.remainder().is_empty() {
+        return Ok(None);
+    }
+    let depth = prefix.len() / 3;
+    if depth >= MAX_MAVEN_DEPENDENCY_DEPTH {
+        return Err(CoreError::new(
+            ErrorCode::ParseFailed,
+            "Maven dependency tree exceeds the supported depth",
+        )
+        .with_details(format!("maximumDepth={MAX_MAVEN_DEPENDENCY_DEPTH}")));
+    }
+
+    let value = line[(marker + 3)..].trim();
+    // Verbose dependency-plugin output wraps omitted nodes as
+    // `(coordinate - annotation)`, while resolved nodes use
+    // `coordinate (annotation)`. Normalize both forms before splitting the
+    // Maven coordinate so duplicate/conflict markers remain observable.
+    let (coordinate, annotation) = if let Some(inner) = value
+        .strip_prefix('(')
+        .and_then(|value| value.strip_suffix(')'))
+    {
+        inner
+            .split_once(" - ")
+            .map(|(coordinate, annotation)| (coordinate.trim(), Some(annotation.trim())))
+            .unwrap_or((inner.trim(), None))
+    } else {
+        value
+            .split_once(" (")
+            .map(|(coordinate, annotation)| (coordinate, Some(annotation.trim_end_matches(')'))))
+            .unwrap_or((value, None))
+    };
+    let parts = coordinate.split(':').collect::<Vec<_>>();
+    let (group_id, artifact_id, artifact_type, classifier, version, scope) = match parts.as_slice()
+    {
+        [group_id, artifact_id, artifact_type, version, scope] => (
+            *group_id,
+            *artifact_id,
+            *artifact_type,
+            None,
+            *version,
+            *scope,
+        ),
+        [group_id, artifact_id, artifact_type, classifier, version, scope] => (
+            *group_id,
+            *artifact_id,
+            *artifact_type,
+            Some(*classifier),
+            *version,
+            *scope,
+        ),
+        _ => return Ok(None),
+    };
+    if [group_id, artifact_id, artifact_type, version, scope]
+        .iter()
+        .any(|value| value.trim().is_empty())
+        || classifier.is_some_and(|value| value.trim().is_empty())
+    {
+        return Ok(None);
+    }
+
+    let (resolution, selected_version) = dependency_resolution(annotation);
+    Ok(Some(ParsedDependency {
+        depth,
+        node: MavenDependencyResponse {
+            module_path: module_path.to_string(),
+            group_id: group_id.to_string(),
+            artifact_id: artifact_id.to_string(),
+            version: version.to_string(),
+            r#type: artifact_type.to_string(),
+            classifier: classifier.map(str::to_string),
+            scope: scope.to_string(),
+            resolution,
+            selected_version,
+            children: Vec::new(),
+        },
+    }))
+}
+
+fn dependency_resolution(
+    annotation: Option<&str>,
+) -> (MavenDependencyResolutionResponse, Option<String>) {
+    let Some(annotation) = annotation else {
+        return (MavenDependencyResolutionResponse::Resolved, None);
+    };
+    let normalized = annotation.to_ascii_lowercase();
+    const CONFLICT: &str = "omitted for conflict with ";
+    if let Some(index) = normalized.find(CONFLICT) {
+        let selected_version = annotation[(index + CONFLICT.len())..]
+            .split_whitespace()
+            .next()
+            .map(|value| value.trim_end_matches([',', ')']).to_string())
+            .filter(|value| !value.is_empty());
+        return (
+            MavenDependencyResolutionResponse::OmittedConflict,
+            selected_version,
+        );
+    }
+    if normalized.contains("omitted for duplicate") {
+        return (MavenDependencyResolutionResponse::OmittedDuplicate, None);
+    }
+    (MavenDependencyResolutionResponse::Resolved, None)
+}
+
+fn build_dependency_level(
+    parsed: &[ParsedDependency],
+    cursor: &mut usize,
+    depth: usize,
+) -> Result<Vec<MavenDependencyResponse>, CoreError> {
+    let mut dependencies = Vec::new();
+    while *cursor < parsed.len() {
+        let entry_depth = parsed[*cursor].depth;
+        if entry_depth < depth {
+            break;
+        }
+        if entry_depth > depth {
+            return Err(invalid_dependency_structure());
+        }
+        let mut dependency = parsed[*cursor].node.clone();
+        *cursor += 1;
+        if *cursor < parsed.len() {
+            let next_depth = parsed[*cursor].depth;
+            if next_depth > depth + 1 {
+                return Err(invalid_dependency_structure());
+            }
+            if next_depth == depth + 1 {
+                dependency.children = build_dependency_level(parsed, cursor, depth + 1)?;
+            }
+        }
+        sort_dependencies(&mut dependency.children);
+        dependencies.push(dependency);
+    }
+    sort_dependencies(&mut dependencies);
+    Ok(dependencies)
+}
+
+fn sort_dependencies(dependencies: &mut [MavenDependencyResponse]) {
+    dependencies.sort_by(|left, right| {
+        (
+            &left.group_id,
+            &left.artifact_id,
+            &left.r#type,
+            &left.classifier,
+            &left.version,
+            &left.scope,
+        )
+            .cmp(&(
+                &right.group_id,
+                &right.artifact_id,
+                &right.r#type,
+                &right.classifier,
+                &right.version,
+                &right.scope,
+            ))
+    });
+}
+
+fn invalid_dependency_structure() -> CoreError {
+    CoreError::new(
+        ErrorCode::ParseFailed,
+        "Maven dependency tree structure is invalid",
+    )
+}
+
 fn module(
     root: &Path,
     base: &Path,
@@ -643,8 +1611,207 @@ fn module(
             .as_ref()
             .map(|value| value.packaging.clone())
             .unwrap_or_else(|| "jar".to_string()),
+        source_roots: source_roots(descriptor.as_ref()),
         modules: child_modules,
     })
+}
+
+fn source_roots(descriptor: Option<&Descriptor>) -> Vec<MavenSourceRootResponse> {
+    let Some(descriptor) = descriptor else {
+        return Vec::new();
+    };
+
+    let mut roots = BTreeSet::new();
+    let build_directory = descriptor.build_directory.as_deref().unwrap_or("target");
+    let has_compiled_output = descriptor.packaging != "pom";
+    if has_compiled_output {
+        add_source_root(
+            &mut roots,
+            MavenSourceRootKind::MainJava,
+            descriptor
+                .source_directory
+                .as_deref()
+                .unwrap_or("src/main/java"),
+            Some(build_directory),
+        );
+        if descriptor.resource_directories.is_empty() {
+            add_source_root(
+                &mut roots,
+                MavenSourceRootKind::MainResources,
+                "src/main/resources",
+                Some(build_directory),
+            );
+        } else {
+            for path in &descriptor.resource_directories {
+                add_source_root(
+                    &mut roots,
+                    MavenSourceRootKind::MainResources,
+                    path,
+                    Some(build_directory),
+                );
+            }
+        }
+        add_source_root(
+            &mut roots,
+            MavenSourceRootKind::TestJava,
+            descriptor
+                .test_source_directory
+                .as_deref()
+                .unwrap_or("src/test/java"),
+            Some(build_directory),
+        );
+        if descriptor.test_resource_directories.is_empty() {
+            add_source_root(
+                &mut roots,
+                MavenSourceRootKind::TestResources,
+                "src/test/resources",
+                Some(build_directory),
+            );
+        } else {
+            for path in &descriptor.test_resource_directories {
+                add_source_root(
+                    &mut roots,
+                    MavenSourceRootKind::TestResources,
+                    path,
+                    Some(build_directory),
+                );
+            }
+        }
+    }
+
+    if has_compiled_output {
+        let default_generated_main = format!("{build_directory}/generated-sources");
+        let generated_main = if descriptor.generated_source_directories.is_empty() {
+            vec![default_generated_main.as_str()]
+        } else {
+            descriptor
+                .generated_source_directories
+                .iter()
+                .map(String::as_str)
+                .collect()
+        };
+        for path in generated_main {
+            add_source_root(
+                &mut roots,
+                MavenSourceRootKind::GeneratedMain,
+                path,
+                Some(build_directory),
+            );
+        }
+
+        let default_generated_test = format!("{build_directory}/generated-test-sources");
+        let generated_test = if descriptor.generated_test_source_directories.is_empty() {
+            vec![default_generated_test.as_str()]
+        } else {
+            descriptor
+                .generated_test_source_directories
+                .iter()
+                .map(String::as_str)
+                .collect()
+        };
+        for path in generated_test {
+            add_source_root(
+                &mut roots,
+                MavenSourceRootKind::GeneratedTest,
+                path,
+                Some(build_directory),
+            );
+        }
+    }
+
+    roots
+        .into_iter()
+        .map(|(rank, path)| MavenSourceRootResponse {
+            path,
+            kind: source_root_kind(rank),
+        })
+        .collect()
+}
+
+fn add_source_root(
+    roots: &mut BTreeSet<(u8, String)>,
+    kind: MavenSourceRootKind,
+    raw_path: &str,
+    build_directory: Option<&str>,
+) {
+    if let Some(path) = normalize_maven_source_path(raw_path, build_directory) {
+        roots.insert((source_root_kind_rank(kind), path));
+    }
+}
+
+fn source_root_kind_rank(kind: MavenSourceRootKind) -> u8 {
+    match kind {
+        MavenSourceRootKind::MainJava => 0,
+        MavenSourceRootKind::MainResources => 1,
+        MavenSourceRootKind::TestJava => 2,
+        MavenSourceRootKind::TestResources => 3,
+        MavenSourceRootKind::GeneratedMain => 4,
+        MavenSourceRootKind::GeneratedTest => 5,
+    }
+}
+
+fn source_root_kind(rank: u8) -> MavenSourceRootKind {
+    match rank {
+        0 => MavenSourceRootKind::MainJava,
+        1 => MavenSourceRootKind::MainResources,
+        2 => MavenSourceRootKind::TestJava,
+        3 => MavenSourceRootKind::TestResources,
+        4 => MavenSourceRootKind::GeneratedMain,
+        _ => MavenSourceRootKind::GeneratedTest,
+    }
+}
+
+fn normalize_maven_source_path(raw_path: &str, build_directory: Option<&str>) -> Option<String> {
+    let mut value = raw_path.trim().replace('\\', "/");
+    value = value
+        .replace("${project.basedir}", ".")
+        .replace("${basedir}", ".");
+    if value.contains("${project.build.directory}") {
+        let build_directory = normalize_build_directory(build_directory)?;
+        value = value.replace("${project.build.directory}", &build_directory);
+    }
+    normalize_maven_path_value(&value)
+}
+
+fn normalize_build_directory(raw_path: Option<&str>) -> Option<String> {
+    let mut value = raw_path.unwrap_or("target").trim().replace('\\', "/");
+    value = value
+        .replace("${project.basedir}", ".")
+        .replace("${basedir}", ".");
+    normalize_maven_path_value(&value)
+}
+
+fn normalize_maven_path_value(raw_path: &str) -> Option<String> {
+    let mut value = raw_path.trim().replace('\\', "/");
+    if value.contains("${") || value.contains('}') {
+        return None;
+    }
+    while let Some(stripped) = value.strip_prefix("./") {
+        value = stripped.to_string();
+    }
+    let path = Path::new(&value);
+    let is_windows_absolute = value.as_bytes().get(1).is_some_and(|byte| *byte == b':');
+    if value.is_empty()
+        || path.is_absolute()
+        || is_windows_absolute
+        || path.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        return None;
+    }
+    let normalized = value.trim_matches('/').to_string();
+    if normalized.is_empty()
+        || normalized
+            .split('/')
+            .any(|component| component.is_empty() || component == "." || component == "..")
+    {
+        return None;
+    }
+    Some(normalized)
 }
 
 fn descriptor(path: &Path) -> Result<Option<Descriptor>, CoreError> {
@@ -661,12 +1828,21 @@ fn descriptor(path: &Path) -> Result<Option<Descriptor>, CoreError> {
     };
     let mut profile_id = None;
     let mut profile_active_by_default = false;
+    let mut pending_build_plugin = None;
 
     loop {
         match reader.read_event_into(&mut buffer) {
             Ok(Event::Start(event)) => {
                 let name = local_name(event.name().as_ref());
+                let starts_build_plugin = name == "plugin"
+                    && stack.len() == 3
+                    && stack[0].0 == "project"
+                    && stack[1].0 == "build"
+                    && stack[2].0 == "plugins";
                 stack.push((name.clone(), String::new()));
+                if starts_build_plugin {
+                    pending_build_plugin = Some(PendingBuildPlugin::default());
+                }
                 if name == "profile" {
                     profile_id = None;
                     profile_active_by_default = false;
@@ -715,6 +1891,61 @@ fn descriptor(path: &Path) -> Result<Option<Descriptor>, CoreError> {
                         value.packaging =
                             non_empty(text.clone()).unwrap_or_else(|| "jar".to_string())
                     }
+                    "project/build/directory" => {
+                        value.build_directory = non_empty(text.clone())
+                    }
+                    "project/build/sourceDirectory" => {
+                        value.source_directory = non_empty(text.clone())
+                    }
+                    "project/build/testSourceDirectory" => {
+                        value.test_source_directory = non_empty(text.clone())
+                    }
+                    "project/build/resources/resource/directory" => {
+                        if let Some(directory) = non_empty(text.clone()) {
+                            value.resource_directories.push(directory);
+                        }
+                    }
+                    "project/build/testResources/testResource/directory" => {
+                        if let Some(directory) = non_empty(text.clone()) {
+                            value.test_resource_directories.push(directory);
+                        }
+                    }
+                    "project/build/plugins/plugin/configuration/generatedSourcesDirectory"
+                    | "project/build/plugins/plugin/executions/execution/configuration/generatedSourcesDirectory" => {
+                        if let Some(directory) = non_empty(text.clone()) {
+                            if let Some(plugin) = pending_build_plugin.as_mut() {
+                                plugin
+                                    .compiler_generated_source_directories
+                                    .push(directory);
+                            }
+                        }
+                    }
+                    "project/build/plugins/plugin/configuration/generatedTestSourcesDirectory"
+                    | "project/build/plugins/plugin/executions/execution/configuration/generatedTestSourcesDirectory" => {
+                        if let Some(directory) = non_empty(text.clone()) {
+                            if let Some(plugin) = pending_build_plugin.as_mut() {
+                                plugin
+                                    .compiler_generated_test_source_directories
+                                    .push(directory);
+                            }
+                        }
+                    }
+                    "project/build/plugins/plugin/configuration/sources/source"
+                    | "project/build/plugins/plugin/executions/execution/configuration/sources/source" => {
+                        if let Some(directory) = non_empty(text.clone()) {
+                            if let Some(plugin) = pending_build_plugin.as_mut() {
+                                plugin.build_helper_source_directories.push(directory);
+                            }
+                        }
+                    }
+                    "project/build/plugins/plugin/configuration/testSources/testSource"
+                    | "project/build/plugins/plugin/executions/execution/configuration/testSources/testSource" => {
+                        if let Some(directory) = non_empty(text.clone()) {
+                            if let Some(plugin) = pending_build_plugin.as_mut() {
+                                plugin.build_helper_test_source_directories.push(directory);
+                            }
+                        }
+                    }
                     "project/modules/module" => {
                         if let Some(module) = non_empty(text.clone()) {
                             value.module_paths.push(module);
@@ -724,8 +1955,32 @@ fn descriptor(path: &Path) -> Result<Option<Descriptor>, CoreError> {
                     // `<pluginManagement>` pins a version for children without
                     // applying it, and one under `<reporting>` never runs.
                     "project/build/plugins/plugin/artifactId" => {
-                        if let Some(artifact) = non_empty(text.clone()) {
-                            value.plugins.push(artifact);
+                        if let Some(plugin) = pending_build_plugin.as_mut() {
+                            plugin.artifact_id = non_empty(text.clone());
+                        }
+                    }
+                    "project/build/plugins/plugin" => {
+                        if let Some(plugin) = pending_build_plugin.take() {
+                            if let Some(artifact_id) = plugin.artifact_id {
+                                match artifact_id.as_str() {
+                                    "maven-compiler-plugin" => {
+                                        value.generated_source_directories.extend(
+                                            plugin.compiler_generated_source_directories,
+                                        );
+                                        value.generated_test_source_directories.extend(
+                                            plugin.compiler_generated_test_source_directories,
+                                        );
+                                    }
+                                    "build-helper-maven-plugin" => {
+                                        value.generated_source_directories
+                                            .extend(plugin.build_helper_source_directories);
+                                        value.generated_test_source_directories
+                                            .extend(plugin.build_helper_test_source_directories);
+                                    }
+                                    _ => {}
+                                }
+                                value.plugins.push(artifact_id);
+                            }
                         }
                     }
                     "project/profiles/profile/id" => profile_id = non_empty(text.clone()),

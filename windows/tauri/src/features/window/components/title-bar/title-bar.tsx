@@ -43,10 +43,19 @@ import WindowMenuBar from "../window-menu-bar";
 
 interface TitleBarProps {
   showMinimal?: boolean;
+  showUpdateControl: boolean;
   onOpenProjectPicker: (mode?: ProjectPickerMode) => void;
 }
 
-const TitleBar = ({ showMinimal = false, onOpenProjectPicker }: TitleBarProps) => {
+export function TitleBarUpdateControl({ visible }: { visible: boolean }) {
+  return visible ? <AppUpdateControl /> : null;
+}
+
+export const TitleBar = ({
+  showMinimal = false,
+  showUpdateControl,
+  onOpenProjectPicker,
+}: TitleBarProps) => {
   const { t } = useTranslation();
   const nativeMenuBar = useSettingsStore((state) => state.settings.nativeMenuBar);
   const compactMenuBar = useSettingsStore((state) => state.settings.compactMenuBar);
@@ -279,7 +288,6 @@ const TitleBar = ({ showMinimal = false, onOpenProjectPicker }: TitleBarProps) =
     return (
       <ChromeBar
         region="title"
-        data-tauri-drag-region
         onMouseDown={handleTitleBarMouseDown}
         className="lithe-title-bar relative z-50 justify-between select-none"
       >
@@ -305,7 +313,6 @@ const TitleBar = ({ showMinimal = false, onOpenProjectPicker }: TitleBarProps) =
             "lithe-title-bar font-sans ui-text-chrome relative z-50 flex h-(--lithe-title-bar-height) items-center justify-between gap-(--lithe-chrome-gap) bg-transparent pr-(--lithe-chrome-padding-inline) text-subtle-foreground",
             isFullscreen ? "pl-2" : "pl-23.5",
           )}
-          data-tauri-drag-region
           onMouseDown={handleTitleBarMouseDown}
         >
           <ChromeGroup className="pointer-events-auto h-full">
@@ -325,12 +332,11 @@ const TitleBar = ({ showMinimal = false, onOpenProjectPicker }: TitleBarProps) =
   return (
     <ContextMenu>
       <ContextMenuTrigger
-        data-tauri-drag-region
         onMouseDown={handleTitleBarMouseDown}
         onContextMenu={handleTitleBarContextMenu}
         className="lithe-title-bar font-sans ui-text-chrome relative z-50 flex h-(--lithe-title-bar-height) items-center justify-between gap-(--lithe-chrome-gap) bg-surface px-(--lithe-chrome-padding-inline) text-muted-foreground"
       >
-        <ChromeGroup data-tauri-drag-region grow className="min-w-0">
+        <ChromeGroup grow className="min-w-0">
           <ChromeGroup className="pointer-events-auto min-w-0">
             {menuItem}
             {projectControls}
@@ -338,7 +344,7 @@ const TitleBar = ({ showMinimal = false, onOpenProjectPicker }: TitleBarProps) =
         </ChromeGroup>
         <ChromeGroup className="pointer-events-auto z-20">
           {quickOpenAction}
-          {isWindows ? <AppUpdateControl /> : null}
+          {isWindows ? <TitleBarUpdateControl visible={showUpdateControl} /> : null}
 
           {showAppWindowControls && (
             <WindowControls
@@ -356,27 +362,30 @@ const TitleBar = ({ showMinimal = false, onOpenProjectPicker }: TitleBarProps) =
 
 const TitleBarWithSettings = ({
   showMinimal = false,
+  showUpdateControl,
 }: Omit<TitleBarProps, "onOpenProjectPicker">) => {
   const isSettingsDialogVisible = useUIState((state) => state.isSettingsDialogVisible);
   const isProjectPickerVisible = useUIState((state) => state.isProjectPickerVisible);
   const setIsSettingsDialogVisible = useUIState((state) => state.setIsSettingsDialogVisible);
   const setIsProjectPickerVisible = useUIState((state) => state.setIsProjectPickerVisible);
-  const [projectPickerMode, setProjectPickerMode] = useState<ProjectPickerMode>("picker");
+  const projectPickerMode = useUIState((state) => state.projectPickerMode);
   const openProjectPicker = useCallback(
     (mode: ProjectPickerMode = "picker") => {
-      setProjectPickerMode(mode);
-      setIsProjectPickerVisible(true);
+      setIsProjectPickerVisible(true, mode);
     },
     [setIsProjectPickerVisible],
   );
   const closeProjectPicker = useCallback(() => {
-    setProjectPickerMode("picker");
     setIsProjectPickerVisible(false);
   }, [setIsProjectPickerVisible]);
 
   return (
     <>
-      <TitleBar showMinimal={showMinimal} onOpenProjectPicker={openProjectPicker} />
+      <TitleBar
+        showMinimal={showMinimal}
+        showUpdateControl={showUpdateControl}
+        onOpenProjectPicker={openProjectPicker}
+      />
       <SettingsDialog
         isOpen={isSettingsDialogVisible}
         onClose={() => setIsSettingsDialogVisible(false)}

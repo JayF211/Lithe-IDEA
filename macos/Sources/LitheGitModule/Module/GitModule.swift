@@ -18,19 +18,29 @@ public final class GitModule: LitheModule {
     public let manifest = moduleManifest
     private let operations: any GitOperations
     private let shelfStorage: any GitShelfStorage
+    private let performanceLogger: any GitPerformanceLogger
+    private let patchFileAccess: (any GitPatchFileAccess)?
     private var capability: GitModuleCapability?
 
-    package init(operations: any GitOperations, shelfStorage: any GitShelfStorage) {
+    package init(
+        operations: any GitOperations,
+        shelfStorage: any GitShelfStorage,
+        performanceLogger: any GitPerformanceLogger = NullGitPerformanceLogger(),
+        patchFileAccess: (any GitPatchFileAccess)? = nil
+    ) {
         self.operations = operations
         self.shelfStorage = shelfStorage
+        self.performanceLogger = performanceLogger
+        self.patchFileAccess = patchFileAccess
     }
 
     public func activate(context: ModuleContext) async throws {
         guard capability == nil else { return }
         let feature = GitFeatureModel(
-            service: GitService(operations: operations),
+            service: GitService(operations: operations, performanceLogger: performanceLogger),
             shelveService: ShelveService(storage: shelfStorage)
         )
+        feature.patchExchange.fileAccess = patchFileAccess
         feature.configureModuleLeases { reason in
             context.leases.acquireLease(reason: reason)
         }
