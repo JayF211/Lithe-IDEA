@@ -3,6 +3,7 @@ import { resolveRunLaunch, startRunProcess, stopRunProcess } from "@/features/ru
 import type {
   MavenLaunchContext,
   MavenLaunchPlan,
+  MavenSettings,
   MavenStoredConfiguration,
 } from "../types/maven.types";
 
@@ -20,6 +21,30 @@ export function writeMavenConfiguration(
 ) {
   return invoke<void>("maven_write_configuration", {
     args: { root, reactorPath, configuration },
+  });
+}
+
+export interface MavenEffectiveConfiguration {
+  settingsPath: string | null;
+  localRepositoryPath: string | null;
+  mavenExecutablePath: string | null;
+  javaHomePath: string | null;
+}
+
+export function resolveMavenEffectiveConfiguration(
+  root: string,
+  workingDirectory: string,
+  settings: MavenSettings,
+) {
+  return invoke<MavenEffectiveConfiguration>("maven_resolve_effective_configuration", {
+    args: {
+      root,
+      workingDirectory,
+      settingsPath: settings.settingsPath,
+      localRepositoryPath: settings.localRepositoryPath,
+      mavenExecutablePath: settings.mavenExecutablePath,
+      javaHomePath: settings.javaHomePath,
+    },
   });
 }
 

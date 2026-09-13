@@ -7,6 +7,10 @@ import { useToast } from "@/features/layout/contexts/toast-context";
 import { themeRegistry } from "@/extensions/themes/theme-registry";
 import { useRegisteredThemes } from "@/extensions/themes/use-registered-themes";
 import { useMavenStore } from "@/features/maven/stores/maven.store";
+import {
+  resolveMavenEffectiveConfiguration,
+  type MavenEffectiveConfiguration,
+} from "@/features/maven/api/maven-host-api";
 import type { MavenSettings } from "@/features/maven/types/maven.types";
 import { useUpdater } from "@/features/settings/hooks/use-updater";
 import { useSettingsStore } from "@/features/settings/stores/settings.store";
@@ -393,6 +397,7 @@ function TerminalPanel() {
 
 function MavenPanel() {
   const { t } = useTranslation();
+  const root = useMavenStore((state) => state.root);
   const project = useMavenStore((state) => state.project);
   const projectStatus = useMavenStore((state) => state.projectStatus);
   const settingsPath = useMavenStore((state) => state.settingsPath);
@@ -407,6 +412,7 @@ function MavenPanel() {
     mavenExecutablePath,
     javaHomePath,
   });
+  const [effective, setEffective] = useState<MavenEffectiveConfiguration | null>(null);
 
   const fields = [
     { field: "settingsPath" as const, label: "settings.xml", directory: false },
@@ -420,6 +426,39 @@ function MavenPanel() {
   useEffect(() => {
     setDraft({ settingsPath, localRepositoryPath, mavenExecutablePath, javaHomePath });
   }, [settingsPath, localRepositoryPath, mavenExecutablePath, javaHomePath]);
+
+  // Resolve what the saved configuration actually uses on this machine. The
+  // detection is keyed to the persisted values: until Apply runs, the gray
+  // lines keep showing the configuration that launches would pick up.
+  useEffect(() => {
+    if (!root || !project) {
+      setEffective(null);
+      return;
+    }
+    let cancelled = false;
+    resolveMavenEffectiveConfiguration(root, project.relativePath, {
+      settingsPath,
+      localRepositoryPath,
+      mavenExecutablePath,
+      javaHomePath,
+    })
+      .then((value) => {
+        if (!cancelled) setEffective(value);
+      })
+      .catch(() => {
+        if (!cancelled) setEffective(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    root,
+    project,
+    settingsPath,
+    localRepositoryPath,
+    mavenExecutablePath,
+    javaHomePath,
+  ]);
 
   const dirty =
     draft.settingsPath !== settingsPath ||
@@ -448,44 +487,57 @@ function MavenPanel() {
           {projectStatus === "loading" ? t("maven.scanning") : t("maven.notDetected")}
         </p>
       )}
-      {fields.map(({ field, label, directory }) => (
-        <label key={field} className="flex flex-col gap-1.5 ui-text-sm text-foreground">
-          {label}
-          <div className="flex gap-2">
-            <input
-              className={`${controlClassName} min-w-0 flex-1 font-mono`}
-              value={draft[field]}
-              placeholder={t("maven.automatic")}
-              disabled={!project}
-              onChange={(event) =>
-                setDraft((current) => ({ ...current, [field]: event.target.value }))
-              }
-            />
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon-sm"
-              disabled={!project}
-              title={t("ui.clear")}
-              aria-label={t("ui.clear")}
-              onClick={() => setDraft((current) => ({ ...current, [field]: "" }))}
-            >
-              <TrashIcon />
-            </Button>
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon-sm"
-              disabled={!project}
-              title={t("ui.browse")}
-              aria-label={t("ui.browse")}
-              onClick={() => void choosePath(field, directory)}
-            >
-              <FolderIcon />
-            </Button>
-          </div>
-        </label>
-      ))}
+      {fields.map(({ field, label, directory }) => {
+        const detectedValue = effective?.[field] ?? null;
+        return (
+          <label key={field} className="flex flex-col gap-1.5 ui-text-sm text-foreground">
+            {label}
+            <div className="flex gap-2">
+              <input
+                className={`${controlClassName} min-w-0 flex-1 font-mono`}
+                value={draft[field]}
+                placeholder={t("maven.automatic")}
+                disabled={!project}
+                onChange={(event) =>
+                  setDraft((current) => ({ ...current, [field]: event.target.value }))
+                }
+              />
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon-sm"
+                disabled={!project}
+                title={t("ui.clear")}
+                aria-label={t("ui.clear")}
+                onClick={() => setDraft((current) => ({ ...current, [field]: "" }))}
+              >
+                <TrashIcon />
+              </Button>
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon-sm"
+                disabled={!project}
+                title={t("ui.browse")}
+                aria-label={t("ui.browse")}
+                onClick={() => void choosePath(field, directory)}
+              >
+                <FolderIcon />
+              </Button>
+            </div>
+            {draft[field] || !effective ? null : (
+              <p
+                className="truncate font-mono text-subtle-foreground ui-text-xs"
+                title={detectedValue ?? undefined}
+              >
+                {detectedValue
+                  ? t("maven.detectedValue", { value: detectedValue })
+                  : t("maven.detectedMissing")}
+              </p>
+            )}
+          </label>
+        );
+      })}
       {configurationSaveError ? (
         <p className="ui-text-sm text-destructive" role="alert">
           {configurationSaveError}

@@ -914,7 +914,10 @@ fn java_home_from_executable(executable: &Path) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
-fn resolve_java_home(root: &Path, override_path: &str) -> Result<Option<String>, String> {
+pub(crate) fn resolve_java_home(
+    root: &Path,
+    override_path: &str,
+) -> Result<Option<String>, String> {
     let configured = override_path.trim();
     if !configured.is_empty() {
         let path = if Path::new(configured).is_absolute() {
@@ -1110,7 +1113,7 @@ fn prepend_runtime_paths(
     Ok(())
 }
 
-fn resolve_maven_executable(
+pub(crate) fn resolve_maven_executable(
     root: &Path,
     working_directory: &Path,
     override_path: &str,
